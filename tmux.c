@@ -1,7 +1,7 @@
 /* $OpenBSD$ */
 
 /*
- * Copyright (c) 2007 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -22,64 +22,44 @@
 #include <errno.h>
 #include <event.h>
 #include <fcntl.h>
-#include <getopt.h>
+#include <langinfo.h>
 #include <locale.h>
 #include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "tmux.h"
 
-#if defined(DEBUG) && defined(__OpenBSD__)
-extern char	*malloc_options;
-#endif
+struct options	*global_options;	/* server options */
+struct options	*global_s_options;	/* session options */
+struct options	*global_w_options;	/* window options */
+struct environ	*global_environ;
+struct hooks	*global_hooks;
 
-struct options	 global_options;	/* server options */
-struct options	 global_s_options;	/* session options */
-struct options	 global_w_options;	/* window options */
-struct environ	 global_environ;
+struct timeval	 start_time;
+const char	*socket_path;
+int		 ptm_fd = -1;
+const char	*shell_command;
 
-struct event_base *ev_base;
+static __dead void	 usage(void);
+static char		*make_label(const char *, char **);
 
-char		*cfg_file;
-char		*shell_cmd;
-int		 debug_level;
-time_t		 start_time;
-char		 socket_path[PATH_MAX];
-int		 login_shell;
-char		*environ_path;
+static const char	*getshell(void);
+static int		 checkshell(const char *);
 
-__dead void	 usage(void);
-char 		*makesocketpath(const char *);
-
-#ifndef HAVE___PROGNAME
-char      *__progname = (char *) "tmux";
-#endif
-
-__dead void
+static __dead void
 usage(void)
 {
 	fprintf(stderr,
 	    "usage: %s [-2CluvV] [-c shell-command] [-f file] [-L socket-name]\n"
 	    "            [-S socket-path] [command [flags]]\n",
-	    __progname);
+	    getprogname());
 	exit(1);
 }
 
-void
-logfile(const char *name)
-{
-	char	*path;
-
-	if (debug_level > 0) {
-		xasprintf(&path, "tmux-%s-%ld.log", name, (long) getpid());
-		log_open(path);
-		free(path);
-	}
-}
-
-const char *
+static const char *
 getshell(void)
 {
 	struct passwd	*pw;
@@ -96,10 +76,10 @@ getshell(void)
 	return (_PATH_BSHELL);
 }
 
-int
+static int
 checkshell(const char *shell)
 {
-	if (shell == NULL || *shell == '\0' || *shell != '/')
+	if (shell == NULL || *shell != '/')
 		return (0);
 	if (areshell(shell))
 		return (0);
@@ -117,7 +97,7 @@ areshell(const char *shell)
 		ptr++;
 	else
 		ptr = shell;
-	progname = __progname;
+	progname = getprogname();
 	if (*progname == '-')
 		progname++;
 	if (strcmp(ptr, progname) == 0)
@@ -125,40 +105,48 @@ areshell(const char *shell)
 	return (0);
 }
 
-char *
-makesocketpath(const char *label)
+static char *
+make_label(const char *label, char **cause)
 {
-	char		base[PATH_MAX], realbase[PATH_MAX], *path, *s;
-	struct stat	sb;
-	u_int		uid;
+	char		*base, resolved[PATH_MAX], *path, *s;
+	struct stat	 sb;
+	uid_t		 uid;
 
+	*cause = NULL;
+
+	if (label == NULL)
+		label = "default";
 	uid = getuid();
+
 	if ((s = getenv("TMUX_TMPDIR")) != NULL && *s != '\0')
-		xsnprintf(base, sizeof base, "%s/tmux-%u", s, uid);
-	else if ((s = getenv("TMPDIR")) != NULL && *s != '\0')
-		xsnprintf(base, sizeof base, "%s/tmux-%u", s, uid);
+		xasprintf(&base, "%s/tmux-%ld", s, (long)uid);
 	else
-		xsnprintf(base, sizeof base, "%s/tmux-%u", _PATH_TMP, uid);
+		xasprintf(&base, "%s/tmux-%ld", _PATH_TMP, (long)uid);
+	if (realpath(base, resolved) == NULL &&
+	    strlcpy(resolved, base, sizeof resolved) >= sizeof resolved) {
+		errno = ERANGE;
+		free(base);
+		goto fail;
+	}
 
-	if (mkdir(base, S_IRWXU) != 0 && errno != EEXIST)
-		return (NULL);
-
-	if (lstat(base, &sb) != 0)
-		return (NULL);
+	if (mkdir(resolved, S_IRWXU) != 0 && errno != EEXIST)
+		goto fail;
+	if (lstat(resolved, &sb) != 0)
+		goto fail;
 	if (!S_ISDIR(sb.st_mode)) {
 		errno = ENOTDIR;
-		return (NULL);
+		goto fail;
 	}
 	if (sb.st_uid != uid || (sb.st_mode & S_IRWXO) != 0) {
 		errno = EACCES;
-		return (NULL);
+		goto fail;
 	}
-
-	if (realpath(base, realbase) == NULL)
-		strlcpy(realbase, base, sizeof realbase);
-
-	xasprintf(&path, "%s/%s", realbase, label);
+	xasprintf(&path, "%s/%s", resolved, label);
 	return (path);
+
+fail:
+	xasprintf(cause, "error creating %s (%s)", resolved, strerror(errno));
+	return (NULL);
 }
 
 void
@@ -175,59 +163,85 @@ setblocking(int fd, int state)
 	}
 }
 
-__dead void
-shell_exec(const char *shell, const char *shellcmd)
+const char *
+find_cwd(void)
 {
-	const char	*shellname, *ptr;
-	char		*argv0;
+	char		 resolved1[PATH_MAX], resolved2[PATH_MAX];
+	static char	 cwd[PATH_MAX];
+	const char	*pwd;
 
-	ptr = strrchr(shell, '/');
-	if (ptr != NULL && *(ptr + 1) != '\0')
-		shellname = ptr + 1;
-	else
-		shellname = shell;
-	if (login_shell)
-		xasprintf(&argv0, "-%s", shellname);
-	else
-		xasprintf(&argv0, "%s", shellname);
-	setenv("SHELL", shell, 1);
+	if (getcwd(cwd, sizeof cwd) == NULL)
+		return (NULL);
+	if ((pwd = getenv("PWD")) == NULL || *pwd == '\0')
+		return (cwd);
 
-	setblocking(STDIN_FILENO, 1);
-	setblocking(STDOUT_FILENO, 1);
-	setblocking(STDERR_FILENO, 1);
-	closefrom(STDERR_FILENO + 1);
+	/*
+	 * We want to use PWD so that symbolic links are maintained,
+	 * but only if it matches the actual working directory.
+	 */
+	if (realpath(pwd, resolved1) == NULL)
+		return (cwd);
+	if (realpath(cwd, resolved2) == NULL)
+		return (cwd);
+	if (strcmp(resolved1, resolved2) != 0)
+		return (cwd);
+	return (pwd);
+}
 
-	execl(shell, argv0, "-c", shellcmd, (char *) NULL);
-	fatal("execl failed");
+const char *
+find_home(void)
+{
+	struct passwd		*pw;
+	static const char	*home;
+
+	if (home != NULL)
+		return (home);
+
+	home = getenv("HOME");
+	if (home == NULL || *home == '\0') {
+		pw = getpwuid(getuid());
+		if (pw != NULL)
+			home = pw->pw_dir;
+		else
+			home = NULL;
+	}
+
+	return (home);
 }
 
 int
 main(int argc, char **argv)
 {
-	struct passwd	*pw;
-	char		*s, *path, *label, **var, tmp[PATH_MAX];
-	char		 in[256];
-	const char	*home;
-	long long	 pid;
-	int	 	 opt, flags, keys, session;
+	char					*path, *label, *cause, **var;
+	const char				*s, *shell, *cwd;
+	int					 opt, flags, keys;
+	const struct options_table_entry	*oe;
 
-#if defined(DEBUG) && defined(__OpenBSD__)
-	malloc_options = (char *) "AFGJPX";
-#endif
+	if (setlocale(LC_CTYPE, "en_US.UTF-8") == NULL &&
+	    setlocale(LC_CTYPE, "C.UTF-8") == NULL) {
+		if (setlocale(LC_CTYPE, "") == NULL)
+			errx(1, "invalid LC_ALL, LC_CTYPE or LANG");
+		s = nl_langinfo(CODESET);
+		if (strcasecmp(s, "UTF-8") != 0 && strcasecmp(s, "UTF8") != 0)
+			errx(1, "need UTF-8 locale (LC_CTYPE) but have %s", s);
+	}
 
 	setlocale(LC_TIME, "");
+	tzset();
 
-	flags = 0;
+	if (**argv == '-')
+		flags = CLIENT_LOGIN;
+	else
+		flags = 0;
+
 	label = path = NULL;
-	login_shell = (**argv == '-');
 	while ((opt = getopt(argc, argv, "2c:Cdf:lL:qS:uUVv")) != -1) {
 		switch (opt) {
 		case '2':
 			flags |= CLIENT_256COLOURS;
 			break;
 		case 'c':
-			free(shell_cmd);
-			shell_cmd = xstrdup(optarg);
+			shell_command = optarg;
 			break;
 		case 'C':
 			if (flags & CLIENT_CONTROL)
@@ -236,14 +250,13 @@ main(int argc, char **argv)
 				flags |= CLIENT_CONTROL;
 			break;
 		case 'V':
-			printf("%s %s\n", __progname, VERSION);
+			printf("%s %s\n", getprogname(), VERSION);
 			exit(0);
 		case 'f':
-			free(cfg_file);
-			cfg_file = xstrdup(optarg);
+			set_cfg_file(optarg);
 			break;
 		case 'l':
-			login_shell = 1;
+			flags |= CLIENT_LOGIN;
 			break;
 		case 'L':
 			free(label);
@@ -259,7 +272,7 @@ main(int argc, char **argv)
 			flags |= CLIENT_UTF8;
 			break;
 		case 'v':
-			debug_level++;
+			log_add_level();
 			break;
 		default:
 			usage();
@@ -268,49 +281,63 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	if (shell_cmd != NULL && argc != 0)
+	if (shell_command != NULL && argc != 0)
 		usage();
 
-	if (!(flags & CLIENT_UTF8)) {
-		/*
-		 * If the user has set whichever of LC_ALL, LC_CTYPE or LANG
-		 * exist (in that order) to contain UTF-8, it is a safe
-		 * assumption that either they are using a UTF-8 terminal, or
-		 * if not they know that output from UTF-8-capable programs may
-		 * be wrong.
-		 */
-		if ((s = getenv("LC_ALL")) == NULL || *s == '\0') {
-			if ((s = getenv("LC_CTYPE")) == NULL || *s == '\0')
-				s = getenv("LANG");
-		}
-		if (s != NULL && (strcasestr(s, "UTF-8") != NULL ||
-		    strcasestr(s, "UTF8") != NULL))
+	if ((ptm_fd = getptmfd()) == -1)
+		err(1, "getptmfd");
+	if (pledge("stdio rpath wpath cpath flock fattr unix getpw sendfd "
+	    "recvfd proc exec tty ps", NULL) != 0)
+		err(1, "pledge");
+
+	/*
+	 * tmux is a UTF-8 terminal, so if TMUX is set, assume UTF-8.
+	 * Otherwise, if the user has set LC_ALL, LC_CTYPE or LANG to contain
+	 * UTF-8, it is a safe assumption that either they are using a UTF-8
+	 * terminal, or if not they know that output from UTF-8-capable
+	 * programs may be wrong.
+	 */
+	if (getenv("TMUX") != NULL)
+		flags |= CLIENT_UTF8;
+	else {
+		s = getenv("LC_ALL");
+		if (s == NULL || *s == '\0')
+			s = getenv("LC_CTYPE");
+		if (s == NULL || *s == '\0')
+			s = getenv("LANG");
+		if (s == NULL || *s == '\0')
+			s = "";
+		if (strcasestr(s, "UTF-8") != NULL ||
+		    strcasestr(s, "UTF8") != NULL)
 			flags |= CLIENT_UTF8;
 	}
 
-	environ_init(&global_environ);
+	global_hooks = hooks_create(NULL);
+
+	global_environ = environ_create();
 	for (var = environ; *var != NULL; var++)
-		environ_put(&global_environ, *var);
-	if (getcwd(tmp, sizeof tmp) != NULL)
-		environ_set(&global_environ, "PWD", tmp);
+		environ_put(global_environ, *var);
+	if ((cwd = find_cwd()) != NULL)
+		environ_set(global_environ, "PWD", "%s", cwd);
 
-	options_init(&global_options, NULL);
-	options_table_populate_tree(server_options_table, &global_options);
-
-	options_init(&global_s_options, NULL);
-	options_table_populate_tree(session_options_table, &global_s_options);
-	options_set_string(&global_s_options, "default-shell", "%s",
-	    getshell());
-
-	options_init(&global_w_options, NULL);
-	options_table_populate_tree(window_options_table, &global_w_options);
-
-	/* Enable UTF-8 if the first client is on UTF-8 terminal. */
-	if (flags & CLIENT_UTF8) {
-		options_set_number(&global_s_options, "status-utf8", 1);
-		options_set_number(&global_s_options, "mouse-utf8", 1);
-		options_set_number(&global_w_options, "utf8", 1);
+	global_options = options_create(NULL);
+	global_s_options = options_create(NULL);
+	global_w_options = options_create(NULL);
+	for (oe = options_table; oe->name != NULL; oe++) {
+		if (oe->scope == OPTIONS_TABLE_SERVER)
+			options_default(global_options, oe);
+		if (oe->scope == OPTIONS_TABLE_SESSION)
+			options_default(global_s_options, oe);
+		if (oe->scope == OPTIONS_TABLE_WINDOW)
+			options_default(global_w_options, oe);
 	}
+
+	/*
+	 * The default shell comes from SHELL or from the user's passwd entry
+	 * if available.
+	 */
+	shell = getshell();
+	options_set_string(global_s_options, "default-shell", 0, "%s", shell);
 
 	/* Override keys to vi if VISUAL or EDITOR are set. */
 	if ((s = getenv("VISUAL")) != NULL || (s = getenv("EDITOR")) != NULL) {
@@ -320,70 +347,32 @@ main(int argc, char **argv)
 			keys = MODEKEY_VI;
 		else
 			keys = MODEKEY_EMACS;
-		options_set_number(&global_s_options, "status-keys", keys);
-		options_set_number(&global_w_options, "mode-keys", keys);
+		options_set_number(global_s_options, "status-keys", keys);
+		options_set_number(global_w_options, "mode-keys", keys);
 	}
-
-	/* Locate the configuration file. */
-	if (cfg_file == NULL) {
-		home = getenv("HOME");
-		if (home == NULL || *home == '\0') {
-			pw = getpwuid(getuid());
-			if (pw != NULL)
-				home = pw->pw_dir;
-			else
-				home = NULL;
-		}
-		if (home != NULL) {
-			xasprintf(&cfg_file, "%s/.tmux.conf", home);
-			if (access(cfg_file, R_OK) != 0 && errno == ENOENT) {
-				free(cfg_file);
-				cfg_file = NULL;
-			}
-		}
-	}
-
-	/* Get path from environment. */
-	s = getenv("TMUX");
-	if (s != NULL && sscanf(s, "%255[^,],%lld,%d", in, &pid, &session) == 3)
-		environ_path = xstrdup(in);
 
 	/*
-	 * Figure out the socket path. If specified on the command-line with -S
-	 * or -L, use it, otherwise try $TMUX or assume -L default.
+	 * If socket is specified on the command-line with -S or -L, it is
+	 * used. Otherwise, $TMUX is checked and if that fails "default" is
+	 * used.
 	 */
-	if (path == NULL) {
-		/* If no -L, use the environment. */
-		if (label == NULL) {
-			if (environ_path != NULL)
-				path = xstrdup(environ_path);
-			else
-				label = xstrdup("default");
-		}
-
-		/* -L or default set. */
-		if (label != NULL) {
-			if ((path = makesocketpath(label)) == NULL) {
-				fprintf(stderr, "can't create socket: %s\n",
-					strerror(errno));
-				exit(1);
-			}
+	if (path == NULL && label == NULL) {
+		s = getenv("TMUX");
+		if (s != NULL && *s != '\0' && *s != ',') {
+			path = xstrdup(s);
+			path[strcspn(path, ",")] = '\0';
 		}
 	}
-	free(label);
-
-	if (strlcpy(socket_path, path, sizeof socket_path) >= sizeof socket_path) {
-		fprintf(stderr, "socket path too long: %s\n", path);
+	if (path == NULL && (path = make_label(label, &cause)) == NULL) {
+		if (cause != NULL) {
+			fprintf(stderr, "%s\n", cause);
+			free(cause);
+		}
 		exit(1);
 	}
-	free(path);
-
-#ifdef HAVE_SETPROCTITLE
-	/* Set process title. */
-	setproctitle("%s (%s)", __progname, socket_path);
-#endif
+	socket_path = path;
+	free(label);
 
 	/* Pass control to the client. */
-	ev_base = osdep_event_init();
-	exit(client_main(argc, argv, flags));
+	exit(client_main(osdep_event_init(), argc, argv, flags));
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2009 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -23,10 +23,14 @@
 #include <unistd.h>
 #include <errno.h>
 
-#include "tmux.h"
+#include "compat.h"
+
+void fatal(const char *, ...);
+void fatalx(const char *, ...);
 
 pid_t
-forkpty(int *master, unused char *name, struct termios *tio, struct winsize *ws)
+forkpty(int *master, __unused char *name, struct termios *tio,
+    struct winsize *ws)
 {
 	int	slave = -1, fd, pipe_fd[2];
 	char   *path, dummy;
@@ -40,6 +44,10 @@ forkpty(int *master, unused char *name, struct termios *tio, struct winsize *ws)
 
 	if ((path = ttyname(*master)) == NULL)
 		goto out;
+
+	if (name != NULL)
+		strlcpy(name, path, TTY_NAME_MAX);
+
 	if ((slave = open(path, O_RDWR|O_NOCTTY)) == -1)
 		goto out;
 

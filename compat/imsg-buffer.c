@@ -1,4 +1,4 @@
-/*	$OpenBSD: imsg-buffer.c,v 1.4 2014/06/30 00:25:17 deraadt Exp $	*/
+/*	$OpenBSD: imsg-buffer.c,v 1.11 2017/12/14 09:27:44 kettenis Exp $	*/
 
 /*
  * Copyright (c) 2003, 2004 Henning Brauer <henning@openbsd.org>
@@ -26,12 +26,12 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "tmux.h"
+#include "compat.h"
 #include "imsg.h"
 
-int	ibuf_realloc(struct ibuf *, size_t);
-void	ibuf_enqueue(struct msgbuf *, struct ibuf *);
-void	ibuf_dequeue(struct msgbuf *, struct ibuf *);
+static int	ibuf_realloc(struct ibuf *, size_t);
+static void	ibuf_enqueue(struct msgbuf *, struct ibuf *);
+static void	ibuf_dequeue(struct msgbuf *, struct ibuf *);
 
 struct ibuf *
 ibuf_open(size_t len)
@@ -67,18 +67,18 @@ ibuf_dynamic(size_t len, size_t max)
 	return (buf);
 }
 
-int
+static int
 ibuf_realloc(struct ibuf *buf, size_t len)
 {
 	u_char	*b;
 
 	/* on static buffers max is eq size and so the following fails */
 	if (buf->wpos + len > buf->max) {
-		errno = ENOMEM;
+		errno = ERANGE;
 		return (-1);
 	}
 
-	b = realloc(buf->buf, buf->wpos + len);
+	b = recallocarray(buf->buf, buf->size, buf->wpos + len, 1);
 	if (b == NULL)
 		return (-1);
 	buf->buf = b;
@@ -149,7 +149,7 @@ ibuf_write(struct msgbuf *msgbuf)
 	unsigned int	 i = 0;
 	ssize_t	n;
 
-	bzero(&iov, sizeof(iov));
+	memset(&iov, 0, sizeof(iov));
 	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
 		if (i >= IOV_MAX)
 			break;
@@ -180,7 +180,9 @@ again:
 void
 ibuf_free(struct ibuf *buf)
 {
-	free(buf->buf);
+	if (buf == NULL)
+		return;
+	freezero(buf->buf, buf->size);
 	free(buf);
 }
 
@@ -233,8 +235,9 @@ msgbuf_write(struct msgbuf *msgbuf)
 		char		buf[CMSG_SPACE(sizeof(int))];
 	} cmsgbuf;
 
-	bzero(&iov, sizeof(iov));
-	bzero(&msg, sizeof(msg));
+	memset(&iov, 0, sizeof(iov));
+	memset(&msg, 0, sizeof(msg));
+	memset(&cmsgbuf, 0, sizeof(cmsgbuf));
 	TAILQ_FOREACH(buf, &msgbuf->bufs, entry) {
 		if (i >= IOV_MAX)
 			break;
@@ -286,14 +289,14 @@ again:
 	return (1);
 }
 
-void
+static void
 ibuf_enqueue(struct msgbuf *msgbuf, struct ibuf *buf)
 {
 	TAILQ_INSERT_TAIL(&msgbuf->bufs, buf, entry);
 	msgbuf->queued++;
 }
 
-void
+static void
 ibuf_dequeue(struct msgbuf *msgbuf, struct ibuf *buf)
 {
 	TAILQ_REMOVE(&msgbuf->bufs, buf, entry);

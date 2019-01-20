@@ -1,7 +1,7 @@
 /* $OpenBSD$ */
 
 /*
- * Copyright (c) 2007 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -17,10 +17,10 @@
  */
 
 #include <sys/types.h>
-#include <sys/time.h>
 
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "tmux.h"
 
@@ -29,27 +29,40 @@
  * string!
  */
 
-u_int	paste_next_index;
-u_int	paste_next_order;
-u_int	paste_num_automatic;
-RB_HEAD(paste_name_tree, paste_buffer) paste_by_name;
-RB_HEAD(paste_time_tree, paste_buffer) paste_by_time;
+struct paste_buffer {
+	char		*data;
+	size_t		 size;
 
-int paste_cmp_names(const struct paste_buffer *, const struct paste_buffer *);
-RB_PROTOTYPE(paste_name_tree, paste_buffer, name_entry, paste_cmp_names);
-RB_GENERATE(paste_name_tree, paste_buffer, name_entry, paste_cmp_names);
+	char		*name;
+	time_t		 created;
+	int		 automatic;
+	u_int		 order;
 
-int paste_cmp_times(const struct paste_buffer *, const struct paste_buffer *);
-RB_PROTOTYPE(paste_time_tree, paste_buffer, time_entry, paste_cmp_times);
-RB_GENERATE(paste_time_tree, paste_buffer, time_entry, paste_cmp_times);
+	RB_ENTRY(paste_buffer) name_entry;
+	RB_ENTRY(paste_buffer) time_entry;
+};
 
-int
+static u_int	paste_next_index;
+static u_int	paste_next_order;
+static u_int	paste_num_automatic;
+static RB_HEAD(paste_name_tree, paste_buffer) paste_by_name;
+static RB_HEAD(paste_time_tree, paste_buffer) paste_by_time;
+
+static int	paste_cmp_names(const struct paste_buffer *,
+		    const struct paste_buffer *);
+RB_GENERATE_STATIC(paste_name_tree, paste_buffer, name_entry, paste_cmp_names);
+
+static int	paste_cmp_times(const struct paste_buffer *,
+		    const struct paste_buffer *);
+RB_GENERATE_STATIC(paste_time_tree, paste_buffer, time_entry, paste_cmp_times);
+
+static int
 paste_cmp_names(const struct paste_buffer *a, const struct paste_buffer *b)
 {
 	return (strcmp(a->name, b->name));
 }
 
-int
+static int
 paste_cmp_times(const struct paste_buffer *a, const struct paste_buffer *b)
 {
 	if (a->order > b->order)
@@ -59,7 +72,37 @@ paste_cmp_times(const struct paste_buffer *a, const struct paste_buffer *b)
 	return (0);
 }
 
-/* Walk paste buffers by name. */
+/* Get paste buffer name. */
+const char *
+paste_buffer_name(struct paste_buffer *pb)
+{
+	return (pb->name);
+}
+
+/* Get paste buffer order. */
+u_int
+paste_buffer_order(struct paste_buffer *pb)
+{
+	return (pb->order);
+}
+
+/* Get paste buffer created. */
+time_t
+paste_buffer_created(struct paste_buffer *pb)
+{
+	return (pb->created);
+}
+
+/* Get paste buffer data. */
+const char *
+paste_buffer_data(struct paste_buffer *pb, size_t *size)
+{
+	if (size != NULL)
+		*size = pb->size;
+	return (pb->data);
+}
+
+/* Walk paste buffers by time. */
 struct paste_buffer *
 paste_walk(struct paste_buffer *pb)
 {
@@ -70,26 +113,16 @@ paste_walk(struct paste_buffer *pb)
 
 /* Get the most recent automatic buffer. */
 struct paste_buffer *
-paste_get_top(void)
+paste_get_top(const char **name)
 {
 	struct paste_buffer	*pb;
 
 	pb = RB_MIN(paste_time_tree, &paste_by_time);
 	if (pb == NULL)
 		return (NULL);
+	if (name != NULL)
+		*name = pb->name;
 	return (pb);
-}
-
-/* Free the most recent buffer. */
-int
-paste_free_top(void)
-{
-	struct paste_buffer	*pb;
-
-	pb = paste_get_top();
-	if (pb == NULL)
-		return (-1);
-	return (paste_free_name(pb->name));
 }
 
 /* Get a paste buffer by name. */
@@ -105,20 +138,10 @@ paste_get_name(const char *name)
 	return (RB_FIND(paste_name_tree, &paste_by_name, &pbfind));
 }
 
-/* Free a paste buffer by name. */
-int
-paste_free_name(const char *name)
+/* Free a paste buffer. */
+void
+paste_free(struct paste_buffer *pb)
 {
-	struct paste_buffer	*pb, pbfind;
-
-	if (name == NULL || *name == '\0')
-		return (-1);
-
-	pbfind.name = (char *)name;
-	pb = RB_FIND(paste_name_tree, &paste_by_name, &pbfind);
-	if (pb == NULL)
-		return (-1);
-
 	RB_REMOVE(paste_name_tree, &paste_by_name, pb);
 	RB_REMOVE(paste_time_tree, &paste_by_time, pb);
 	if (pb->automatic)
@@ -127,7 +150,6 @@ paste_free_name(const char *name)
 	free(pb->data);
 	free(pb->name);
 	free(pb);
-	return (0);
 }
 
 /*
@@ -140,15 +162,17 @@ paste_add(char *data, size_t size)
 	struct paste_buffer	*pb, *pb1;
 	u_int			 limit;
 
-	if (size == 0)
+	if (size == 0) {
+		free(data);
 		return;
+	}
 
-	limit = options_get_number(&global_options, "buffer-limit");
+	limit = options_get_number(global_options, "buffer-limit");
 	RB_FOREACH_REVERSE_SAFE(pb, paste_time_tree, &paste_by_time, pb1) {
 		if (paste_num_automatic < limit)
 			break;
 		if (pb->automatic)
-			paste_free_name(pb->name);
+			paste_free(pb);
 	}
 
 	pb = xmalloc(sizeof *pb);
@@ -165,6 +189,8 @@ paste_add(char *data, size_t size)
 
 	pb->automatic = 1;
 	paste_num_automatic++;
+
+	pb->created = time(NULL);
 
 	pb->order = paste_next_order++;
 	RB_INSERT(paste_name_tree, &paste_by_name, pb);
@@ -226,7 +252,7 @@ paste_rename(const char *oldname, const char *newname, char **cause)
 int
 paste_set(char *data, size_t size, const char *name, char **cause)
 {
-	struct paste_buffer	*pb;
+	struct paste_buffer	*pb, *old;
 
 	if (cause != NULL)
 		*cause = NULL;
@@ -246,7 +272,6 @@ paste_set(char *data, size_t size, const char *name, char **cause)
 		return (-1);
 	}
 
-
 	pb = xmalloc(sizeof *pb);
 
 	pb->name = xstrdup(name);
@@ -257,8 +282,10 @@ paste_set(char *data, size_t size, const char *name, char **cause)
 	pb->automatic = 0;
 	pb->order = paste_next_order++;
 
-	if (paste_get_name(name) != NULL)
-		paste_free_name(name);
+	pb->created = time(NULL);
+
+	if ((old = paste_get_name(name)) != NULL)
+		paste_free(old);
 
 	RB_INSERT(paste_name_tree, &paste_by_name, pb);
 	RB_INSERT(paste_time_tree, &paste_by_time, pb);
@@ -268,7 +295,7 @@ paste_set(char *data, size_t size, const char *name, char **cause)
 
 /* Convert start of buffer into a nice string. */
 char *
-paste_make_sample(struct paste_buffer *pb, int utf8flag)
+paste_make_sample(struct paste_buffer *pb)
 {
 	char		*buf;
 	size_t		 len, used;
@@ -280,40 +307,8 @@ paste_make_sample(struct paste_buffer *pb, int utf8flag)
 		len = width;
 	buf = xreallocarray(NULL, len, 4 + 4);
 
-	if (utf8flag)
-		used = utf8_strvis(buf, pb->data, len, flags);
-	else
-		used = strvisx(buf, pb->data, len, flags);
+	used = utf8_strvis(buf, pb->data, len, flags);
 	if (pb->size > width || used > width)
 		strlcpy(buf + width, "...", 4);
 	return (buf);
-}
-
-/* Paste into a window pane, filtering '\n' according to separator. */
-void
-paste_send_pane(struct paste_buffer *pb, struct window_pane *wp,
-    const char *sep, int bracket)
-{
-	const char	*data = pb->data, *end = data + pb->size, *lf;
-	size_t		 seplen;
-
-	if (wp->flags & PANE_INPUTOFF)
-		return;
-
-	if (bracket && (wp->screen->mode & MODE_BRACKETPASTE))
-		bufferevent_write(wp->event, "\033[200~", 6);
-
-	seplen = strlen(sep);
-	while ((lf = memchr(data, '\n', end - data)) != NULL) {
-		if (lf != data)
-			bufferevent_write(wp->event, data, lf - data);
-		bufferevent_write(wp->event, sep, seplen);
-		data = lf + 1;
-	}
-
-	if (end != data)
-		bufferevent_write(wp->event, data, end - data);
-
-	if (bracket && (wp->screen->mode & MODE_BRACKETPASTE))
-		bufferevent_write(wp->event, "\033[201~", 6);
 }

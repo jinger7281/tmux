@@ -1,7 +1,7 @@
 /* $OpenBSD$ */
 
 /*
- * Copyright (c) 2009 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2009 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -27,51 +27,110 @@
  * Show environment.
  */
 
-enum cmd_retval	 cmd_show_environment_exec(struct cmd *, struct cmd_q *);
+static enum cmd_retval	cmd_show_environment_exec(struct cmd *,
+			    struct cmdq_item *);
+
+static char	*cmd_show_environment_escape(struct environ_entry *);
+static void	 cmd_show_environment_print(struct cmd *, struct cmdq_item *,
+		     struct environ_entry *);
 
 const struct cmd_entry cmd_show_environment_entry = {
-	"show-environment", "showenv",
-	"gt:", 0, 1,
-	"[-g] " CMD_TARGET_SESSION_USAGE " [name]",
-	0,
-	cmd_show_environment_exec
+	.name = "show-environment",
+	.alias = "showenv",
+
+	.args = { "gst:", 0, 1 },
+	.usage = "[-gs] " CMD_TARGET_SESSION_USAGE " [name]",
+
+	.target = { 't', CMD_FIND_SESSION, CMD_FIND_CANFAIL },
+
+	.flags = CMD_AFTERHOOK,
+	.exec = cmd_show_environment_exec
 };
 
-enum cmd_retval
-cmd_show_environment_exec(struct cmd *self, struct cmd_q *cmdq)
+static char *
+cmd_show_environment_escape(struct environ_entry *envent)
+{
+	const char	*value = envent->value;
+	char		 c, *out, *ret;
+
+	out = ret = xmalloc(strlen(value) * 2 + 1); /* at most twice the size */
+	while ((c = *value++) != '\0') {
+		/* POSIX interprets $ ` " and \ in double quotes. */
+		if (c == '$' || c == '`' || c == '"' || c == '\\')
+			*out++ = '\\';
+		*out++ = c;
+	}
+	*out = '\0';
+
+	return (ret);
+}
+
+static void
+cmd_show_environment_print(struct cmd *self, struct cmdq_item *item,
+    struct environ_entry *envent)
+{
+	char	*escaped;
+
+	if (!args_has(self->args, 's')) {
+		if (envent->value != NULL)
+			cmdq_print(item, "%s=%s", envent->name, envent->value);
+		else
+			cmdq_print(item, "-%s", envent->name);
+		return;
+	}
+
+	if (envent->value != NULL) {
+		escaped = cmd_show_environment_escape(envent);
+		cmdq_print(item, "%s=\"%s\"; export %s;", envent->name, escaped,
+		    envent->name);
+		free(escaped);
+	} else
+		cmdq_print(item, "unset %s;", envent->name);
+}
+
+static enum cmd_retval
+cmd_show_environment_exec(struct cmd *self, struct cmdq_item *item)
 {
 	struct args		*args = self->args;
-	struct session		*s;
 	struct environ		*env;
 	struct environ_entry	*envent;
+	const char		*target;
+
+	if ((target = args_get(args, 't')) != NULL) {
+		if (item->target.s == NULL) {
+			cmdq_error(item, "no such session: %s", target);
+			return (CMD_RETURN_ERROR);
+		}
+	}
 
 	if (args_has(self->args, 'g'))
-		env = &global_environ;
+		env = global_environ;
 	else {
-		if ((s = cmd_find_session(cmdq, args_get(args, 't'), 0)) == NULL)
+		if (item->target.s == NULL) {
+			target = args_get(args, 't');
+			if (target != NULL)
+				cmdq_error(item, "no such session: %s", target);
+			else
+				cmdq_error(item, "no current session");
 			return (CMD_RETURN_ERROR);
-		env = &s->environ;
+		}
+		env = item->target.s->environ;
 	}
 
 	if (args->argc != 0) {
 		envent = environ_find(env, args->argv[0]);
 		if (envent == NULL) {
-			cmdq_error(cmdq, "unknown variable: %s", args->argv[0]);
+			cmdq_error(item, "unknown variable: %s", args->argv[0]);
 			return (CMD_RETURN_ERROR);
 		}
-		if (envent->value != NULL)
-			cmdq_print(cmdq, "%s=%s", envent->name, envent->value);
-		else
-			cmdq_print(cmdq, "-%s", envent->name);
+		cmd_show_environment_print(self, item, envent);
 		return (CMD_RETURN_NORMAL);
 	}
 
-	RB_FOREACH(envent, environ, env) {
-		if (envent->value != NULL)
-			cmdq_print(cmdq, "%s=%s", envent->name, envent->value);
-		else
-			cmdq_print(cmdq, "-%s", envent->name);
+	envent = environ_first(env);
+	while (envent != NULL) {
+		cmd_show_environment_print(self, item, envent);
+		envent = environ_next(envent);
 	}
-
 	return (CMD_RETURN_NORMAL);
 }

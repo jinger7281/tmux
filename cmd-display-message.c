@@ -32,57 +32,38 @@
 	"#{window_name}, current pane #{pane_index} "	\
 	"- (%H:%M %d-%b-%y)"
 
-enum cmd_retval	 cmd_display_message_exec(struct cmd *, struct cmd_q *);
+static enum cmd_retval	cmd_display_message_exec(struct cmd *,
+			    struct cmdq_item *);
 
 const struct cmd_entry cmd_display_message_entry = {
-	"display-message", "display",
-	"c:pt:F:", 0, 1,
-	"[-p] [-c target-client] [-F format] " CMD_TARGET_PANE_USAGE
-	" [message]",
-	0,
-	cmd_display_message_exec
+	.name = "display-message",
+	.alias = "display",
+
+	.args = { "c:pt:F:", 0, 1 },
+	.usage = "[-p] [-c target-client] [-F format] "
+		 CMD_TARGET_PANE_USAGE " [message]",
+
+	.target = { 't', CMD_FIND_PANE, 0 },
+
+	.flags = CMD_AFTERHOOK,
+	.exec = cmd_display_message_exec
 };
 
-enum cmd_retval
-cmd_display_message_exec(struct cmd *self, struct cmd_q *cmdq)
+static enum cmd_retval
+cmd_display_message_exec(struct cmd *self, struct cmdq_item *item)
 {
 	struct args		*args = self->args;
-	struct client		*c;
-	struct session		*s;
-	struct winlink		*wl;
-	struct window_pane	*wp;
+	struct client		*c, *target_c;
+	struct session		*s = item->target.s;
+	struct winlink		*wl = item->target.wl;
+	struct window_pane	*wp = item->target.wp;
 	const char		*template;
 	char			*msg;
 	struct format_tree	*ft;
-	char			 out[BUFSIZ];
-	time_t			 t;
-	size_t			 len;
-
-	if (args_has(args, 't')) {
-		wl = cmd_find_pane(cmdq, args_get(args, 't'), &s, &wp);
-		if (wl == NULL)
-			return (CMD_RETURN_ERROR);
-	} else {
-		wl = cmd_find_pane(cmdq, NULL, &s, &wp);
-		if (wl == NULL)
-			return (CMD_RETURN_ERROR);
-	}
 
 	if (args_has(args, 'F') && args->argc != 0) {
-		cmdq_error(cmdq, "only one of -F or argument must be given");
+		cmdq_error(item, "only one of -F or argument must be given");
 		return (CMD_RETURN_ERROR);
-	}
-
-	if (args_has(args, 'c')) {
-		c = cmd_find_client(cmdq, args_get(args, 'c'), 0);
-		if (c == NULL)
-			return (CMD_RETURN_ERROR);
-	} else {
-		c = cmd_find_client(cmdq, NULL, 1);
-		if (c == NULL && !args_has(self->args, 'p')) {
-			cmdq_error(cmdq, "no client available");
-			return (CMD_RETURN_ERROR);
-		}
 	}
 
 	template = args_get(args, 'F');
@@ -91,19 +72,27 @@ cmd_display_message_exec(struct cmd *self, struct cmd_q *cmdq)
 	if (template == NULL)
 		template = DISPLAY_MESSAGE_TEMPLATE;
 
-	ft = format_create();
-	format_defaults(ft, c, s, wl, wp);
-
-	t = time(NULL);
-	len = strftime(out, sizeof out, template, localtime(&t));
-	out[len] = '\0';
-
-	msg = format_expand(ft, out);
-	if (args_has(self->args, 'p'))
-		cmdq_print(cmdq, "%s", msg);
+	/*
+	 * -c is intended to be the client where the message should be
+	 * displayed if -p is not given. But it makes sense to use it for the
+	 * formats too, assuming it matches the session. If it doesn't, use the
+	 * best client for the session.
+	 */
+	c = cmd_find_client(item, args_get(args, 'c'), 1);
+	if (c != NULL && c->session == s)
+		target_c = c;
 	else
+		target_c = cmd_find_best_client(s);
+	ft = format_create(item->client, item, FORMAT_NONE, 0);
+	format_defaults(ft, target_c, s, wl, wp);
+
+	msg = format_expand_time(ft, template, time(NULL));
+	if (args_has(self->args, 'p'))
+		cmdq_print(item, "%s", msg);
+	else if (c != NULL)
 		status_message_set(c, "%s", msg);
 	free(msg);
+
 	format_free(ft);
 
 	return (CMD_RETURN_NORMAL);

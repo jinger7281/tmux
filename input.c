@@ -1,7 +1,7 @@
 /* $OpenBSD$ */
 
 /*
- * Copyright (c) 2007 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,15 +18,19 @@
 
 #include <sys/types.h>
 
+#include <netinet/in.h>
+
+#include <resolv.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "tmux.h"
 
 /*
  * Based on the description by Paul Williams at:
  *
- * http://vt100.net/emu/dec_ansi_parser
+ * https://vt100.net/emu/dec_ansi_parser
  *
  * With the following changes:
  *
@@ -54,6 +58,19 @@ struct input_cell {
 	int			g1set;	/* 1 if ACS */
 };
 
+/* Input parser argument. */
+struct input_param {
+	enum {
+		INPUT_MISSING,
+		INPUT_NUMBER,
+		INPUT_STRING
+	}                       type;
+	union {
+		int		num;
+		char	       *str;
+	};
+};
+
 /* Input parser context. */
 struct input_ctx {
 	struct window_pane     *wp;
@@ -76,17 +93,26 @@ struct input_ctx {
 	u_char		       *input_buf;
 	size_t			input_len;
 	size_t			input_space;
+	enum {
+		INPUT_END_ST,
+		INPUT_END_BEL
+	}			input_end;
 
-	int			param_list[24];	/* -1 not present */
+	struct input_param	param_list[24];
 	u_int			param_list_len;
 
 	struct utf8_data	utf8data;
+	int			utf8started;
 
 	int			ch;
+	int			last;
+
 	int			flags;
 #define INPUT_DISCARD 0x1
 
 	const struct input_state *state;
+
+	struct event		timer;
 
 	/*
 	 * All input received since we were last in the ground state. Sent to
@@ -97,45 +123,52 @@ struct input_ctx {
 
 /* Helper functions. */
 struct input_transition;
-int	input_split(struct input_ctx *);
-int	input_get(struct input_ctx *, u_int, int, int);
-void	input_reply(struct input_ctx *, const char *, ...);
-void	input_set_state(struct window_pane *, const struct input_transition *);
-void	input_reset_cell(struct input_ctx *);
+static int	input_split(struct input_ctx *);
+static int	input_get(struct input_ctx *, u_int, int, int);
+static void printflike(2, 3) input_reply(struct input_ctx *, const char *, ...);
+static void	input_set_state(struct window_pane *,
+		    const struct input_transition *);
+static void	input_reset_cell(struct input_ctx *);
+
+static void	input_osc_4(struct input_ctx *, const char *);
+static void	input_osc_10(struct input_ctx *, const char *);
+static void	input_osc_11(struct input_ctx *, const char *);
+static void	input_osc_52(struct input_ctx *, const char *);
+static void	input_osc_104(struct input_ctx *, const char *);
 
 /* Transition entry/exit handlers. */
-void	input_clear(struct input_ctx *);
-void	input_ground(struct input_ctx *);
-void	input_enter_osc(struct input_ctx *);
-void	input_exit_osc(struct input_ctx *);
-void	input_enter_apc(struct input_ctx *);
-void	input_exit_apc(struct input_ctx *);
-void	input_enter_rename(struct input_ctx *);
-void	input_exit_rename(struct input_ctx *);
+static void	input_clear(struct input_ctx *);
+static void	input_ground(struct input_ctx *);
+static void	input_enter_dcs(struct input_ctx *);
+static void	input_enter_osc(struct input_ctx *);
+static void	input_exit_osc(struct input_ctx *);
+static void	input_enter_apc(struct input_ctx *);
+static void	input_exit_apc(struct input_ctx *);
+static void	input_enter_rename(struct input_ctx *);
+static void	input_exit_rename(struct input_ctx *);
 
 /* Input state handlers. */
-int	input_print(struct input_ctx *);
-int	input_intermediate(struct input_ctx *);
-int	input_parameter(struct input_ctx *);
-int	input_input(struct input_ctx *);
-int	input_c0_dispatch(struct input_ctx *);
-int	input_esc_dispatch(struct input_ctx *);
-int	input_csi_dispatch(struct input_ctx *);
-void	input_csi_dispatch_rm(struct input_ctx *);
-void	input_csi_dispatch_rm_private(struct input_ctx *);
-void	input_csi_dispatch_sm(struct input_ctx *);
-void	input_csi_dispatch_sm_private(struct input_ctx *);
-void	input_csi_dispatch_winops(struct input_ctx *);
-void	input_csi_dispatch_sgr_256(struct input_ctx *, int, u_int *);
-void	input_csi_dispatch_sgr_rgb(struct input_ctx *, int, u_int *);
-void	input_csi_dispatch_sgr(struct input_ctx *);
-int	input_dcs_dispatch(struct input_ctx *);
-int	input_utf8_open(struct input_ctx *);
-int	input_utf8_add(struct input_ctx *);
-int	input_utf8_close(struct input_ctx *);
+static int	input_print(struct input_ctx *);
+static int	input_intermediate(struct input_ctx *);
+static int	input_parameter(struct input_ctx *);
+static int	input_input(struct input_ctx *);
+static int	input_c0_dispatch(struct input_ctx *);
+static int	input_esc_dispatch(struct input_ctx *);
+static int	input_csi_dispatch(struct input_ctx *);
+static void	input_csi_dispatch_rm(struct input_ctx *);
+static void	input_csi_dispatch_rm_private(struct input_ctx *);
+static void	input_csi_dispatch_sm(struct input_ctx *);
+static void	input_csi_dispatch_sm_private(struct input_ctx *);
+static void	input_csi_dispatch_winops(struct input_ctx *);
+static void	input_csi_dispatch_sgr_256(struct input_ctx *, int, u_int *);
+static void	input_csi_dispatch_sgr_rgb(struct input_ctx *, int, u_int *);
+static void	input_csi_dispatch_sgr(struct input_ctx *);
+static int	input_dcs_dispatch(struct input_ctx *);
+static int	input_top_bit_set(struct input_ctx *);
+static int	input_end_bel(struct input_ctx *);
 
 /* Command table comparison function. */
-int	input_table_compare(const void *, const void *);
+static int	input_table_compare(const void *, const void *);
 
 /* Command table entry. */
 struct input_table_entry {
@@ -160,10 +193,11 @@ enum input_esc_type {
 	INPUT_ESC_SCSG0_ON,
 	INPUT_ESC_SCSG1_OFF,
 	INPUT_ESC_SCSG1_ON,
+	INPUT_ESC_ST,
 };
 
 /* Escape command table. */
-const struct input_table_entry input_esc_table[] = {
+static const struct input_table_entry input_esc_table[] = {
 	{ '0', "(", INPUT_ESC_SCSG0_ON },
 	{ '0', ")", INPUT_ESC_SCSG1_ON },
 	{ '7', "",  INPUT_ESC_DECSC },
@@ -177,6 +211,7 @@ const struct input_table_entry input_esc_table[] = {
 	{ 'E', "",  INPUT_ESC_NEL },
 	{ 'H', "",  INPUT_ESC_HTS },
 	{ 'M', "",  INPUT_ESC_RI },
+	{ '\\', "", INPUT_ESC_ST },
 	{ 'c', "",  INPUT_ESC_RIS },
 };
 
@@ -204,19 +239,21 @@ enum input_csi_type {
 	INPUT_CSI_ICH,
 	INPUT_CSI_IL,
 	INPUT_CSI_RCP,
+	INPUT_CSI_REP,
 	INPUT_CSI_RM,
 	INPUT_CSI_RM_PRIVATE,
 	INPUT_CSI_SCP,
 	INPUT_CSI_SGR,
 	INPUT_CSI_SM,
 	INPUT_CSI_SM_PRIVATE,
+	INPUT_CSI_SU,
 	INPUT_CSI_TBC,
 	INPUT_CSI_VPA,
 	INPUT_CSI_WINOPS,
 };
 
 /* Control (CSI) command table. */
-const struct input_table_entry input_csi_table[] = {
+static const struct input_table_entry input_csi_table[] = {
 	{ '@', "",  INPUT_CSI_ICH },
 	{ 'A', "",  INPUT_CSI_CUU },
 	{ 'B', "",  INPUT_CSI_CUD },
@@ -231,8 +268,10 @@ const struct input_table_entry input_csi_table[] = {
 	{ 'L', "",  INPUT_CSI_IL },
 	{ 'M', "",  INPUT_CSI_DL },
 	{ 'P', "",  INPUT_CSI_DCH },
+	{ 'S', "",  INPUT_CSI_SU },
 	{ 'X', "",  INPUT_CSI_ECH },
 	{ 'Z', "",  INPUT_CSI_CBT },
+	{ 'b', "",  INPUT_CSI_REP },
 	{ 'c', "",  INPUT_CSI_DA },
 	{ 'c', ">", INPUT_CSI_DA_TWO },
 	{ 'd', "",  INPUT_CSI_VPA },
@@ -275,169 +314,145 @@ struct input_state {
 	{ 0x1b, 0x1b, NULL,		 &input_state_esc_enter }
 
 /* Forward declarations of state tables. */
-const struct input_transition input_state_ground_table[];
-const struct input_transition input_state_esc_enter_table[];
-const struct input_transition input_state_esc_intermediate_table[];
-const struct input_transition input_state_csi_enter_table[];
-const struct input_transition input_state_csi_parameter_table[];
-const struct input_transition input_state_csi_intermediate_table[];
-const struct input_transition input_state_csi_ignore_table[];
-const struct input_transition input_state_dcs_enter_table[];
-const struct input_transition input_state_dcs_parameter_table[];
-const struct input_transition input_state_dcs_intermediate_table[];
-const struct input_transition input_state_dcs_handler_table[];
-const struct input_transition input_state_dcs_escape_table[];
-const struct input_transition input_state_dcs_ignore_table[];
-const struct input_transition input_state_osc_string_table[];
-const struct input_transition input_state_apc_string_table[];
-const struct input_transition input_state_rename_string_table[];
-const struct input_transition input_state_consume_st_table[];
-const struct input_transition input_state_utf8_three_table[];
-const struct input_transition input_state_utf8_two_table[];
-const struct input_transition input_state_utf8_one_table[];
+static const struct input_transition input_state_ground_table[];
+static const struct input_transition input_state_esc_enter_table[];
+static const struct input_transition input_state_esc_intermediate_table[];
+static const struct input_transition input_state_csi_enter_table[];
+static const struct input_transition input_state_csi_parameter_table[];
+static const struct input_transition input_state_csi_intermediate_table[];
+static const struct input_transition input_state_csi_ignore_table[];
+static const struct input_transition input_state_dcs_enter_table[];
+static const struct input_transition input_state_dcs_parameter_table[];
+static const struct input_transition input_state_dcs_intermediate_table[];
+static const struct input_transition input_state_dcs_handler_table[];
+static const struct input_transition input_state_dcs_escape_table[];
+static const struct input_transition input_state_dcs_ignore_table[];
+static const struct input_transition input_state_osc_string_table[];
+static const struct input_transition input_state_apc_string_table[];
+static const struct input_transition input_state_rename_string_table[];
+static const struct input_transition input_state_consume_st_table[];
 
 /* ground state definition. */
-const struct input_state input_state_ground = {
+static const struct input_state input_state_ground = {
 	"ground",
 	input_ground, NULL,
 	input_state_ground_table
 };
 
 /* esc_enter state definition. */
-const struct input_state input_state_esc_enter = {
+static const struct input_state input_state_esc_enter = {
 	"esc_enter",
 	input_clear, NULL,
 	input_state_esc_enter_table
 };
 
 /* esc_intermediate state definition. */
-const struct input_state input_state_esc_intermediate = {
+static const struct input_state input_state_esc_intermediate = {
 	"esc_intermediate",
 	NULL, NULL,
 	input_state_esc_intermediate_table
 };
 
 /* csi_enter state definition. */
-const struct input_state input_state_csi_enter = {
+static const struct input_state input_state_csi_enter = {
 	"csi_enter",
 	input_clear, NULL,
 	input_state_csi_enter_table
 };
 
 /* csi_parameter state definition. */
-const struct input_state input_state_csi_parameter = {
+static const struct input_state input_state_csi_parameter = {
 	"csi_parameter",
 	NULL, NULL,
 	input_state_csi_parameter_table
 };
 
 /* csi_intermediate state definition. */
-const struct input_state input_state_csi_intermediate = {
+static const struct input_state input_state_csi_intermediate = {
 	"csi_intermediate",
 	NULL, NULL,
 	input_state_csi_intermediate_table
 };
 
 /* csi_ignore state definition. */
-const struct input_state input_state_csi_ignore = {
+static const struct input_state input_state_csi_ignore = {
 	"csi_ignore",
 	NULL, NULL,
 	input_state_csi_ignore_table
 };
 
 /* dcs_enter state definition. */
-const struct input_state input_state_dcs_enter = {
+static const struct input_state input_state_dcs_enter = {
 	"dcs_enter",
-	input_clear, NULL,
+	input_enter_dcs, NULL,
 	input_state_dcs_enter_table
 };
 
 /* dcs_parameter state definition. */
-const struct input_state input_state_dcs_parameter = {
+static const struct input_state input_state_dcs_parameter = {
 	"dcs_parameter",
 	NULL, NULL,
 	input_state_dcs_parameter_table
 };
 
 /* dcs_intermediate state definition. */
-const struct input_state input_state_dcs_intermediate = {
+static const struct input_state input_state_dcs_intermediate = {
 	"dcs_intermediate",
 	NULL, NULL,
 	input_state_dcs_intermediate_table
 };
 
 /* dcs_handler state definition. */
-const struct input_state input_state_dcs_handler = {
+static const struct input_state input_state_dcs_handler = {
 	"dcs_handler",
 	NULL, NULL,
 	input_state_dcs_handler_table
 };
 
 /* dcs_escape state definition. */
-const struct input_state input_state_dcs_escape = {
+static const struct input_state input_state_dcs_escape = {
 	"dcs_escape",
 	NULL, NULL,
 	input_state_dcs_escape_table
 };
 
 /* dcs_ignore state definition. */
-const struct input_state input_state_dcs_ignore = {
+static const struct input_state input_state_dcs_ignore = {
 	"dcs_ignore",
 	NULL, NULL,
 	input_state_dcs_ignore_table
 };
 
 /* osc_string state definition. */
-const struct input_state input_state_osc_string = {
+static const struct input_state input_state_osc_string = {
 	"osc_string",
 	input_enter_osc, input_exit_osc,
 	input_state_osc_string_table
 };
 
 /* apc_string state definition. */
-const struct input_state input_state_apc_string = {
+static const struct input_state input_state_apc_string = {
 	"apc_string",
 	input_enter_apc, input_exit_apc,
 	input_state_apc_string_table
 };
 
 /* rename_string state definition. */
-const struct input_state input_state_rename_string = {
+static const struct input_state input_state_rename_string = {
 	"rename_string",
 	input_enter_rename, input_exit_rename,
 	input_state_rename_string_table
 };
 
 /* consume_st state definition. */
-const struct input_state input_state_consume_st = {
+static const struct input_state input_state_consume_st = {
 	"consume_st",
-	NULL, NULL,
+	input_enter_rename, NULL, /* rename also waits for ST */
 	input_state_consume_st_table
 };
 
-/* utf8_three state definition. */
-const struct input_state input_state_utf8_three = {
-	"utf8_three",
-	NULL, NULL,
-	input_state_utf8_three_table
-};
-
-/* utf8_two state definition. */
-const struct input_state input_state_utf8_two = {
-	"utf8_two",
-	NULL, NULL,
-	input_state_utf8_two_table
-};
-
-/* utf8_one state definition. */
-const struct input_state input_state_utf8_one = {
-	"utf8_one",
-	NULL, NULL,
-	input_state_utf8_one_table
-};
-
 /* ground state table. */
-const struct input_transition input_state_ground_table[] = {
+static const struct input_transition input_state_ground_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch, NULL },
@@ -445,17 +460,13 @@ const struct input_transition input_state_ground_table[] = {
 	{ 0x1c, 0x1f, input_c0_dispatch, NULL },
 	{ 0x20, 0x7e, input_print,	 NULL },
 	{ 0x7f, 0x7f, NULL,		 NULL },
-	{ 0x80, 0xc1, input_print,	 NULL },
-	{ 0xc2, 0xdf, input_utf8_open,	 &input_state_utf8_one },
-	{ 0xe0, 0xef, input_utf8_open,	 &input_state_utf8_two },
-	{ 0xf0, 0xf4, input_utf8_open,	 &input_state_utf8_three },
-	{ 0xf5, 0xff, input_print,	 NULL },
+	{ 0x80, 0xff, input_top_bit_set, NULL },
 
 	{ -1, -1, NULL, NULL }
 };
 
 /* esc_enter state table. */
-const struct input_transition input_state_esc_enter_table[] = {
+static const struct input_transition input_state_esc_enter_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch,  NULL },
@@ -481,8 +492,8 @@ const struct input_transition input_state_esc_enter_table[] = {
 	{ -1, -1, NULL, NULL }
 };
 
-/* esc_interm state table. */
-const struct input_transition input_state_esc_intermediate_table[] = {
+/* esc_intermediate state table. */
+static const struct input_transition input_state_esc_intermediate_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch,  NULL },
@@ -496,7 +507,7 @@ const struct input_transition input_state_esc_intermediate_table[] = {
 };
 
 /* csi_enter state table. */
-const struct input_transition input_state_csi_enter_table[] = {
+static const struct input_transition input_state_csi_enter_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch,  NULL },
@@ -504,7 +515,7 @@ const struct input_transition input_state_csi_enter_table[] = {
 	{ 0x1c, 0x1f, input_c0_dispatch,  NULL },
 	{ 0x20, 0x2f, input_intermediate, &input_state_csi_intermediate },
 	{ 0x30, 0x39, input_parameter,	  &input_state_csi_parameter },
-	{ 0x3a, 0x3a, NULL,		  &input_state_csi_ignore },
+	{ 0x3a, 0x3a, input_parameter,	  &input_state_csi_parameter },
 	{ 0x3b, 0x3b, input_parameter,	  &input_state_csi_parameter },
 	{ 0x3c, 0x3f, input_intermediate, &input_state_csi_parameter },
 	{ 0x40, 0x7e, input_csi_dispatch, &input_state_ground },
@@ -514,7 +525,7 @@ const struct input_transition input_state_csi_enter_table[] = {
 };
 
 /* csi_parameter state table. */
-const struct input_transition input_state_csi_parameter_table[] = {
+static const struct input_transition input_state_csi_parameter_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch,  NULL },
@@ -522,7 +533,7 @@ const struct input_transition input_state_csi_parameter_table[] = {
 	{ 0x1c, 0x1f, input_c0_dispatch,  NULL },
 	{ 0x20, 0x2f, input_intermediate, &input_state_csi_intermediate },
 	{ 0x30, 0x39, input_parameter,	  NULL },
-	{ 0x3a, 0x3a, NULL,		  &input_state_csi_ignore },
+	{ 0x3a, 0x3a, input_parameter,	  NULL },
 	{ 0x3b, 0x3b, input_parameter,	  NULL },
 	{ 0x3c, 0x3f, NULL,		  &input_state_csi_ignore },
 	{ 0x40, 0x7e, input_csi_dispatch, &input_state_ground },
@@ -532,7 +543,7 @@ const struct input_transition input_state_csi_parameter_table[] = {
 };
 
 /* csi_intermediate state table. */
-const struct input_transition input_state_csi_intermediate_table[] = {
+static const struct input_transition input_state_csi_intermediate_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch,  NULL },
@@ -547,7 +558,7 @@ const struct input_transition input_state_csi_intermediate_table[] = {
 };
 
 /* csi_ignore state table. */
-const struct input_transition input_state_csi_ignore_table[] = {
+static const struct input_transition input_state_csi_ignore_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, input_c0_dispatch, NULL },
@@ -561,7 +572,7 @@ const struct input_transition input_state_csi_ignore_table[] = {
 };
 
 /* dcs_enter state table. */
-const struct input_transition input_state_dcs_enter_table[] = {
+static const struct input_transition input_state_dcs_enter_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,		  NULL },
@@ -579,7 +590,7 @@ const struct input_transition input_state_dcs_enter_table[] = {
 };
 
 /* dcs_parameter state table. */
-const struct input_transition input_state_dcs_parameter_table[] = {
+static const struct input_transition input_state_dcs_parameter_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,		  NULL },
@@ -596,8 +607,8 @@ const struct input_transition input_state_dcs_parameter_table[] = {
 	{ -1, -1, NULL, NULL }
 };
 
-/* dcs_interm state table. */
-const struct input_transition input_state_dcs_intermediate_table[] = {
+/* dcs_intermediate state table. */
+static const struct input_transition input_state_dcs_intermediate_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,		  NULL },
@@ -612,7 +623,7 @@ const struct input_transition input_state_dcs_intermediate_table[] = {
 };
 
 /* dcs_handler state table. */
-const struct input_transition input_state_dcs_handler_table[] = {
+static const struct input_transition input_state_dcs_handler_table[] = {
 	/* No INPUT_STATE_ANYWHERE */
 
 	{ 0x00, 0x1a, input_input,  NULL },
@@ -623,7 +634,7 @@ const struct input_transition input_state_dcs_handler_table[] = {
 };
 
 /* dcs_escape state table. */
-const struct input_transition input_state_dcs_escape_table[] = {
+static const struct input_transition input_state_dcs_escape_table[] = {
 	/* No INPUT_STATE_ANYWHERE */
 
 	{ 0x00, 0x5b, input_input,	  &input_state_dcs_handler },
@@ -634,7 +645,7 @@ const struct input_transition input_state_dcs_escape_table[] = {
 };
 
 /* dcs_ignore state table. */
-const struct input_transition input_state_dcs_ignore_table[] = {
+static const struct input_transition input_state_dcs_ignore_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,	    NULL },
@@ -646,21 +657,21 @@ const struct input_transition input_state_dcs_ignore_table[] = {
 };
 
 /* osc_string state table. */
-const struct input_transition input_state_osc_string_table[] = {
+static const struct input_transition input_state_osc_string_table[] = {
 	INPUT_STATE_ANYWHERE,
 
-	{ 0x00, 0x06, NULL,	    NULL },
-	{ 0x07, 0x07, NULL,	    &input_state_ground },
-	{ 0x08, 0x17, NULL,	    NULL },
-	{ 0x19, 0x19, NULL,	    NULL },
-	{ 0x1c, 0x1f, NULL,	    NULL },
-	{ 0x20, 0xff, input_input,  NULL },
+	{ 0x00, 0x06, NULL,	     NULL },
+	{ 0x07, 0x07, input_end_bel, &input_state_ground },
+	{ 0x08, 0x17, NULL,	     NULL },
+	{ 0x19, 0x19, NULL,	     NULL },
+	{ 0x1c, 0x1f, NULL,	     NULL },
+	{ 0x20, 0xff, input_input,   NULL },
 
 	{ -1, -1, NULL, NULL }
 };
 
 /* apc_string state table. */
-const struct input_transition input_state_apc_string_table[] = {
+static const struct input_transition input_state_apc_string_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,	    NULL },
@@ -672,7 +683,7 @@ const struct input_transition input_state_apc_string_table[] = {
 };
 
 /* rename_string state table. */
-const struct input_transition input_state_rename_string_table[] = {
+static const struct input_transition input_state_rename_string_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,	    NULL },
@@ -684,7 +695,7 @@ const struct input_transition input_state_rename_string_table[] = {
 };
 
 /* consume_st state table. */
-const struct input_transition input_state_consume_st_table[] = {
+static const struct input_transition input_state_consume_st_table[] = {
 	INPUT_STATE_ANYWHERE,
 
 	{ 0x00, 0x17, NULL,	    NULL },
@@ -695,41 +706,8 @@ const struct input_transition input_state_consume_st_table[] = {
 	{ -1, -1, NULL, NULL }
 };
 
-/* utf8_three state table. */
-const struct input_transition input_state_utf8_three_table[] = {
-	/* No INPUT_STATE_ANYWHERE */
-
-	{ 0x00, 0x7f, NULL,		&input_state_ground },
-	{ 0x80, 0xbf, input_utf8_add,	&input_state_utf8_two },
-	{ 0xc0, 0xff, NULL,		&input_state_ground },
-
-	{ -1, -1, NULL, NULL }
-};
-
-/* utf8_two state table. */
-const struct input_transition input_state_utf8_two_table[] = {
-	/* No INPUT_STATE_ANYWHERE */
-
-	{ 0x00, 0x7f, NULL,	      &input_state_ground },
-	{ 0x80, 0xbf, input_utf8_add, &input_state_utf8_one },
-	{ 0xc0, 0xff, NULL,	      &input_state_ground },
-
-	{ -1, -1, NULL, NULL }
-};
-
-/* utf8_one state table. */
-const struct input_transition input_state_utf8_one_table[] = {
-	/* No INPUT_STATE_ANYWHERE */
-
-	{ 0x00, 0x7f, NULL,		&input_state_ground },
-	{ 0x80, 0xbf, input_utf8_close, &input_state_ground },
-	{ 0xc0, 0xff, NULL,		&input_state_ground },
-
-	{ -1, -1, NULL, NULL }
-};
-
 /* Input table compare. */
-int
+static int
 input_table_compare(const void *key, const void *value)
 {
 	const struct input_ctx		*ictx = key;
@@ -740,8 +718,32 @@ input_table_compare(const void *key, const void *value)
 	return (strcmp(ictx->interm_buf, entry->interm));
 }
 
+/*
+ * Timer - if this expires then have been waiting for a terminator for too
+ * long, so reset to ground.
+ */
+static void
+input_timer_callback(__unused int fd, __unused short events, void *arg)
+{
+	struct input_ctx	*ictx = arg;
+	struct window_pane	*wp = ictx->wp;
+
+	log_debug("%s: %%%u %s expired" , __func__, wp->id, ictx->state->name);
+	input_reset(wp, 0);
+}
+
+/* Start the timer. */
+static void
+input_start_timer(struct input_ctx *ictx)
+{
+	struct timeval	tv = { .tv_usec = 100000 };
+
+	event_del(&ictx->timer);
+	event_add(&ictx->timer, &tv);
+}
+
 /* Reset cell state to default. */
-void
+static void
 input_reset_cell(struct input_ctx *ictx)
 {
 	memcpy(&ictx->cell.cell, &grid_default_cell, sizeof ictx->cell.cell);
@@ -761,24 +763,16 @@ input_init(struct window_pane *wp)
 
 	ictx = wp->ictx = xcalloc(1, sizeof *ictx);
 
-	input_reset_cell(ictx);
-
-	*ictx->interm_buf = '\0';
-	ictx->interm_len = 0;
-
-	*ictx->param_buf = '\0';
-	ictx->param_len = 0;
-
 	ictx->input_space = INPUT_BUF_START;
 	ictx->input_buf = xmalloc(INPUT_BUF_START);
 
-	*ictx->input_buf = '\0';
-	ictx->input_len = 0;
-
-	ictx->state = &input_state_ground;
-	ictx->flags = 0;
-
 	ictx->since_ground = evbuffer_new();
+	if (ictx->since_ground == NULL)
+		fatalx("out of memory");
+
+	evtimer_set(&ictx->timer, input_timer_callback, ictx);
+
+	input_reset(wp, 0);
 }
 
 /* Destroy input parser. */
@@ -786,31 +780,45 @@ void
 input_free(struct window_pane *wp)
 {
 	struct input_ctx	*ictx = wp->ictx;
+	u_int			 i;
+
+	for (i = 0; i < ictx->param_list_len; i++) {
+		if (ictx->param_list[i].type == INPUT_STRING)
+			free(ictx->param_list[i].str);
+	}
+
+	event_del(&ictx->timer);
 
 	free(ictx->input_buf);
 	evbuffer_free(ictx->since_ground);
 
-	free (ictx);
+	free(ictx);
 	wp->ictx = NULL;
 }
 
 /* Reset input state and clear screen. */
 void
-input_reset(struct window_pane *wp)
+input_reset(struct window_pane *wp, int clear)
 {
 	struct input_ctx	*ictx = wp->ictx;
 
-	memcpy(&ictx->cell, &grid_default_cell, sizeof ictx->cell);
-	memcpy(&ictx->old_cell, &ictx->cell, sizeof ictx->old_cell);
-	ictx->old_cx = 0;
-	ictx->old_cy = 0;
+	input_reset_cell(ictx);
 
-	if (wp->mode == NULL)
-		screen_write_start(&ictx->ctx, wp, &wp->base);
-	else
-		screen_write_start(&ictx->ctx, NULL, &wp->base);
-	screen_write_reset(&ictx->ctx);
-	screen_write_stop(&ictx->ctx);
+	if (clear) {
+		if (wp->mode == NULL)
+			screen_write_start(&ictx->ctx, wp, &wp->base);
+		else
+			screen_write_start(&ictx->ctx, NULL, &wp->base);
+		screen_write_reset(&ictx->ctx);
+		screen_write_stop(&ictx->ctx);
+	}
+
+	input_clear(ictx);
+
+	ictx->last = -1;
+
+	ictx->state = &input_state_ground;
+	ictx->flags = 0;
 }
 
 /* Return pending data. */
@@ -821,7 +829,7 @@ input_pending(struct window_pane *wp)
 }
 
 /* Change input state. */
-void
+static void
 input_set_state(struct window_pane *wp, const struct input_transition *itr)
 {
 	struct input_ctx	*ictx = wp->ictx;
@@ -846,8 +854,8 @@ input_parse(struct window_pane *wp)
 	if (EVBUFFER_LENGTH(evb) == 0)
 		return;
 
-	wp->window->flags |= WINDOW_ACTIVITY;
-	wp->window->flags &= ~WINDOW_SILENCE;
+	window_update_activity(wp->window);
+	wp->flags |= PANE_CHANGED;
 
 	/*
 	 * Open the screen. Use NULL wp if there is a mode set as don't want to
@@ -861,13 +869,16 @@ input_parse(struct window_pane *wp)
 
 	buf = EVBUFFER_DATA(evb);
 	len = EVBUFFER_LENGTH(evb);
-	notify_input(wp, evb);
 	off = 0;
+
+	notify_input(wp, evb);
+
+	log_debug("%s: %%%u %s, %zu bytes: %.*s", __func__, wp->id,
+	    ictx->state->name, len, (int)len, buf);
 
 	/* Parse the input. */
 	while (off < len) {
 		ictx->ch = buf[off++];
-		log_debug("%s: '%c' %s", __func__, ictx->ch, ictx->state->name);
 
 		/* Find the transition. */
 		itr = ictx->state->transitions;
@@ -878,8 +889,18 @@ input_parse(struct window_pane *wp)
 		}
 		if (itr->first == -1 || itr->last == -1) {
 			/* No transition? Eh? */
-			fatalx("No transition from state!");
+			fatalx("no transition from state");
 		}
+
+		/*
+		 * Any state except print stops the current collection. This is
+		 * an optimization to avoid checking if the attributes have
+		 * changed for every character. It will stop unnecessarily for
+		 * sequences that don't make a terminal change, but they should
+		 * be the minority.
+		 */
+		if (itr->handler != input_print)
+			screen_write_collect_end(&ictx->ctx);
 
 		/*
 		 * Execute the handler, if any. Don't switch state if it
@@ -904,62 +925,86 @@ input_parse(struct window_pane *wp)
 }
 
 /* Split the parameter list (if any). */
-int
+static int
 input_split(struct input_ctx *ictx)
-
 {
-	const char	*errstr;
-	char		*ptr, *out;
-	int		 n;
+	const char		*errstr;
+	char			*ptr, *out;
+	struct input_param	*ip;
+	u_int			 i;
 
+	for (i = 0; i < ictx->param_list_len; i++) {
+		if (ictx->param_list[i].type == INPUT_STRING)
+			free(ictx->param_list[i].str);
+	}
 	ictx->param_list_len = 0;
+
 	if (ictx->param_len == 0)
 		return (0);
+	ip = &ictx->param_list[0];
 
 	ptr = ictx->param_buf;
 	while ((out = strsep(&ptr, ";")) != NULL) {
 		if (*out == '\0')
-			n = -1;
+			ip->type = INPUT_MISSING;
 		else {
-			n = strtonum(out, 0, INT_MAX, &errstr);
-			if (errstr != NULL)
-				return (-1);
+			if (strchr(out, ':') != NULL) {
+				ip->type = INPUT_STRING;
+				ip->str = xstrdup(out);
+			} else {
+				ip->type = INPUT_NUMBER;
+				ip->num = strtonum(out, 0, INT_MAX, &errstr);
+				if (errstr != NULL)
+					return (-1);
+			}
 		}
-
-		ictx->param_list[ictx->param_list_len++] = n;
+		ip = &ictx->param_list[++ictx->param_list_len];
 		if (ictx->param_list_len == nitems(ictx->param_list))
 			return (-1);
+	}
+
+	for (i = 0; i < ictx->param_list_len; i++) {
+		ip = &ictx->param_list[i];
+		if (ip->type == INPUT_MISSING)
+			log_debug("parameter %u: missing", i);
+		else if (ip->type == INPUT_STRING)
+			log_debug("parameter %u: string %s", i, ip->str);
+		else if (ip->type == INPUT_NUMBER)
+			log_debug("parameter %u: number %d", i, ip->num);
 	}
 
 	return (0);
 }
 
 /* Get an argument or return default value. */
-int
+static int
 input_get(struct input_ctx *ictx, u_int validx, int minval, int defval)
 {
-	int	retval;
+	struct input_param	*ip;
+	int			 retval;
 
 	if (validx >= ictx->param_list_len)
 	    return (defval);
-
-	retval = ictx->param_list[validx];
-	if (retval == -1)
+	ip = &ictx->param_list[validx];
+	if (ip->type == INPUT_MISSING)
 		return (defval);
+	if (ip->type == INPUT_STRING)
+		return (-1);
+	retval = ip->num;
 	if (retval < minval)
 		return (minval);
 	return (retval);
 }
 
 /* Reply to terminal query. */
-void
+static void
 input_reply(struct input_ctx *ictx, const char *fmt, ...)
 {
-	va_list	ap;
-	char   *reply;
+	va_list	 ap;
+	char	*reply;
 
 	va_start(ap, fmt);
-	vasprintf(&reply, fmt, ap);
+	xvasprintf(&reply, fmt, ap);
 	va_end(ap);
 
 	bufferevent_write(ictx->wp->event, reply, strlen(reply));
@@ -967,9 +1012,11 @@ input_reply(struct input_ctx *ictx, const char *fmt, ...)
 }
 
 /* Clear saved state. */
-void
+static void
 input_clear(struct input_ctx *ictx)
 {
+	event_del(&ictx->timer);
+
 	*ictx->interm_buf = '\0';
 	ictx->interm_len = 0;
 
@@ -979,13 +1026,16 @@ input_clear(struct input_ctx *ictx)
 	*ictx->input_buf = '\0';
 	ictx->input_len = 0;
 
+	ictx->input_end = INPUT_END_ST;
+
 	ictx->flags &= ~INPUT_DISCARD;
 }
 
 /* Reset for ground state. */
-void
+static void
 input_ground(struct input_ctx *ictx)
 {
+	event_del(&ictx->timer);
 	evbuffer_drain(ictx->since_ground, EVBUFFER_LENGTH(ictx->since_ground));
 
 	if (ictx->input_space > INPUT_BUF_START) {
@@ -995,10 +1045,12 @@ input_ground(struct input_ctx *ictx)
 }
 
 /* Output this character to the screen. */
-int
+static int
 input_print(struct input_ctx *ictx)
 {
 	int	set;
+
+	ictx->utf8started = 0; /* can't be valid UTF-8 */
 
 	set = ictx->cell.set == 0 ? ictx->cell.g0set : ictx->cell.g1set;
 	if (set == 1)
@@ -1006,8 +1058,9 @@ input_print(struct input_ctx *ictx)
 	else
 		ictx->cell.cell.attr &= ~GRID_ATTR_CHARSET;
 
-	grid_cell_one(&ictx->cell.cell, ictx->ch);
-	screen_write_cell(&ictx->ctx, &ictx->cell.cell);
+	utf8_set(&ictx->cell.cell.data, ictx->ch);
+	screen_write_collect_add(&ictx->ctx, &ictx->cell.cell);
+	ictx->last = ictx->ch;
 
 	ictx->cell.cell.attr &= ~GRID_ATTR_CHARSET;
 
@@ -1015,7 +1068,7 @@ input_print(struct input_ctx *ictx)
 }
 
 /* Collect intermediate string. */
-int
+static int
 input_intermediate(struct input_ctx *ictx)
 {
 	if (ictx->interm_len == (sizeof ictx->interm_buf) - 1)
@@ -1029,7 +1082,7 @@ input_intermediate(struct input_ctx *ictx)
 }
 
 /* Collect parameter string. */
-int
+static int
 input_parameter(struct input_ctx *ictx)
 {
 	if (ictx->param_len == (sizeof ictx->param_buf) - 1)
@@ -1043,7 +1096,7 @@ input_parameter(struct input_ctx *ictx)
 }
 
 /* Collect input string. */
-int
+static int
 input_input(struct input_ctx *ictx)
 {
 	size_t available;
@@ -1065,20 +1118,22 @@ input_input(struct input_ctx *ictx)
 }
 
 /* Execute C0 control sequence. */
-int
+static int
 input_c0_dispatch(struct input_ctx *ictx)
 {
 	struct screen_write_ctx	*sctx = &ictx->ctx;
 	struct window_pane	*wp = ictx->wp;
 	struct screen		*s = sctx->s;
 
-	log_debug("%s: '%c", __func__, ictx->ch);
+	ictx->utf8started = 0; /* can't be valid UTF-8 */
+
+	log_debug("%s: '%c'", __func__, ictx->ch);
 
 	switch (ictx->ch) {
 	case '\000':	/* NUL */
 		break;
 	case '\007':	/* BEL */
-		wp->window->flags |= WINDOW_BELL;
+		alerts_queue(wp->window, WINDOW_BELL);
 		break;
 	case '\010':	/* BS */
 		screen_write_backspace(sctx);
@@ -1098,7 +1153,7 @@ input_c0_dispatch(struct input_ctx *ictx)
 	case '\012':	/* LF */
 	case '\013':	/* VT */
 	case '\014':	/* FF */
-		screen_write_linefeed(sctx, 0);
+		screen_write_linefeed(sctx, 0, ictx->cell.cell.bg);
 		break;
 	case '\015':	/* CR */
 		screen_write_carriagereturn(sctx);
@@ -1114,11 +1169,12 @@ input_c0_dispatch(struct input_ctx *ictx)
 		break;
 	}
 
+	ictx->last = -1;
 	return (0);
 }
 
 /* Execute escape sequence. */
-int
+static int
 input_esc_dispatch(struct input_ctx *ictx)
 {
 	struct screen_write_ctx		*sctx = &ictx->ctx;
@@ -1138,22 +1194,24 @@ input_esc_dispatch(struct input_ctx *ictx)
 
 	switch (entry->type) {
 	case INPUT_ESC_RIS:
+		window_pane_reset_palette(ictx->wp);
 		input_reset_cell(ictx);
 		screen_write_reset(sctx);
+		screen_write_clearhistory(sctx);
 		break;
 	case INPUT_ESC_IND:
-		screen_write_linefeed(sctx, 0);
+		screen_write_linefeed(sctx, 0, ictx->cell.cell.bg);
 		break;
 	case INPUT_ESC_NEL:
 		screen_write_carriagereturn(sctx);
-		screen_write_linefeed(sctx, 0);
+		screen_write_linefeed(sctx, 0, ictx->cell.cell.bg);
 		break;
 	case INPUT_ESC_HTS:
 		if (s->cx < screen_size_x(s))
 			bit_set(s->tabs, s->cx);
 		break;
 	case INPUT_ESC_RI:
-		screen_write_reverseindex(sctx);
+		screen_write_reverseindex(sctx, ictx->cell.cell.bg);
 		break;
 	case INPUT_ESC_DECKPAM:
 		screen_write_mode_set(sctx, MODE_KKEYPAD);
@@ -1185,26 +1243,33 @@ input_esc_dispatch(struct input_ctx *ictx)
 	case INPUT_ESC_SCSG1_OFF:
 		ictx->cell.g1set = 0;
 		break;
+	case INPUT_ESC_ST:
+		/* ST terminates OSC but the state transition already did it. */
+		break;
 	}
 
+	ictx->last = -1;
 	return (0);
 }
 
 /* Execute control sequence. */
-int
+static int
 input_csi_dispatch(struct input_ctx *ictx)
 {
 	struct screen_write_ctx	       *sctx = &ictx->ctx;
 	struct screen		       *s = sctx->s;
 	struct input_table_entry       *entry;
-	int				n, m;
+	int				i, n, m;
+	u_int				cx, bg = ictx->cell.cell.bg;
 
 	if (ictx->flags & INPUT_DISCARD)
 		return (0);
-	if (input_split(ictx) != 0)
-		return (0);
+
 	log_debug("%s: '%c' \"%s\" \"%s\"",
 	    __func__, ictx->ch, ictx->interm_buf, ictx->param_buf);
+
+	if (input_split(ictx) != 0)
+		return (0);
 
 	entry = bsearch(ictx, input_csi_table, nitems(input_csi_table),
 	    sizeof input_csi_table[0], input_table_compare);
@@ -1216,43 +1281,66 @@ input_csi_dispatch(struct input_ctx *ictx)
 	switch (entry->type) {
 	case INPUT_CSI_CBT:
 		/* Find the previous tab point, n times. */
+		cx = s->cx;
+		if (cx > screen_size_x(s) - 1)
+			cx = screen_size_x(s) - 1;
 		n = input_get(ictx, 0, 1, 1);
-		while (s->cx > 0 && n-- > 0) {
+		if (n == -1)
+			break;
+		while (cx > 0 && n-- > 0) {
 			do
-				s->cx--;
-			while (s->cx > 0 && !bit_test(s->tabs, s->cx));
+				cx--;
+			while (cx > 0 && !bit_test(s->tabs, cx));
 		}
+		s->cx = cx;
 		break;
 	case INPUT_CSI_CUB:
-		screen_write_cursorleft(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_cursorleft(sctx, n);
 		break;
 	case INPUT_CSI_CUD:
-		screen_write_cursordown(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_cursordown(sctx, n);
 		break;
 	case INPUT_CSI_CUF:
-		screen_write_cursorright(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_cursorright(sctx, n);
 		break;
 	case INPUT_CSI_CUP:
 		n = input_get(ictx, 0, 1, 1);
 		m = input_get(ictx, 1, 1, 1);
-		screen_write_cursormove(sctx, m - 1, n - 1);
+		if (n != -1 && m != -1)
+			screen_write_cursormove(sctx, m - 1, n - 1);
 		break;
 	case INPUT_CSI_WINOPS:
 		input_csi_dispatch_winops(ictx);
 		break;
 	case INPUT_CSI_CUU:
-		screen_write_cursorup(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_cursorup(sctx, n);
 		break;
 	case INPUT_CSI_CNL:
-		screen_write_carriagereturn(sctx);
-		screen_write_cursordown(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1) {
+			screen_write_carriagereturn(sctx);
+			screen_write_cursordown(sctx, n);
+		}
 		break;
 	case INPUT_CSI_CPL:
-		screen_write_carriagereturn(sctx);
-		screen_write_cursorup(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1) {
+			screen_write_carriagereturn(sctx);
+			screen_write_cursorup(sctx, n);
+		}
 		break;
 	case INPUT_CSI_DA:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 0:
 			input_reply(ictx, "\033[?1;2c");
 			break;
@@ -1263,6 +1351,8 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_DA_TWO:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 0:
 			input_reply(ictx, "\033[>84;0;0c");
 			break;
@@ -1272,21 +1362,30 @@ input_csi_dispatch(struct input_ctx *ictx)
 		}
 		break;
 	case INPUT_CSI_ECH:
-		screen_write_clearcharacter(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_clearcharacter(sctx, n, bg);
 		break;
 	case INPUT_CSI_DCH:
-		screen_write_deletecharacter(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_deletecharacter(sctx, n, bg);
 		break;
 	case INPUT_CSI_DECSTBM:
 		n = input_get(ictx, 0, 1, 1);
 		m = input_get(ictx, 1, 1, screen_size_y(s));
-		screen_write_scrollregion(sctx, n - 1, m - 1);
+		if (n != -1 && m != -1)
+			screen_write_scrollregion(sctx, n - 1, m - 1);
 		break;
 	case INPUT_CSI_DL:
-		screen_write_deleteline(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_deleteline(sctx, n, bg);
 		break;
 	case INPUT_CSI_DSR:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 5:
 			input_reply(ictx, "\033[0n");
 			break;
@@ -1300,24 +1399,24 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_ED:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 0:
-			screen_write_clearendofscreen(sctx);
+			screen_write_clearendofscreen(sctx, bg);
 			break;
 		case 1:
-			screen_write_clearstartofscreen(sctx);
+			screen_write_clearstartofscreen(sctx, bg);
 			break;
 		case 2:
-			screen_write_clearscreen(sctx);
+			screen_write_clearscreen(sctx, bg);
 			break;
 		case 3:
-			switch (input_get(ictx, 1, 0, 0)) {
-			case 0:
+			if (input_get(ictx, 1, 0, 0) == 0) {
 				/*
 				 * Linux console extension to clear history
 				 * (for example before locking the screen).
 				 */
 				screen_write_clearhistory(sctx);
-				break;
 			}
 			break;
 		default:
@@ -1327,14 +1426,16 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_EL:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 0:
-			screen_write_clearendofline(sctx);
+			screen_write_clearendofline(sctx, bg);
 			break;
 		case 1:
-			screen_write_clearstartofline(sctx);
+			screen_write_clearstartofline(sctx, bg);
 			break;
 		case 2:
-			screen_write_clearline(sctx);
+			screen_write_clearline(sctx, bg);
 			break;
 		default:
 			log_debug("%s: unknown '%c'", __func__, ictx->ch);
@@ -1343,13 +1444,30 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_HPA:
 		n = input_get(ictx, 0, 1, 1);
-		screen_write_cursormove(sctx, n - 1, s->cy);
+		if (n != -1)
+			screen_write_cursormove(sctx, n - 1, s->cy);
 		break;
 	case INPUT_CSI_ICH:
-		screen_write_insertcharacter(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_insertcharacter(sctx, n, bg);
 		break;
 	case INPUT_CSI_IL:
-		screen_write_insertline(sctx, input_get(ictx, 0, 1, 1));
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_insertline(sctx, n, bg);
+		break;
+	case INPUT_CSI_REP:
+		n = input_get(ictx, 0, 1, 1);
+		if (n == -1)
+			break;
+
+		if (ictx->last == -1)
+			break;
+		ictx->ch = ictx->last;
+
+		for (i = 0; i < n; i++)
+			input_print(ictx);
 		break;
 	case INPUT_CSI_RCP:
 		memcpy(&ictx->cell, &ictx->old_cell, sizeof ictx->cell);
@@ -1375,8 +1493,15 @@ input_csi_dispatch(struct input_ctx *ictx)
 	case INPUT_CSI_SM_PRIVATE:
 		input_csi_dispatch_sm_private(ictx);
 		break;
+	case INPUT_CSI_SU:
+		n = input_get(ictx, 0, 1, 1);
+		if (n != -1)
+			screen_write_scrollup(sctx, n, bg);
+		break;
 	case INPUT_CSI_TBC:
 		switch (input_get(ictx, 0, 0, 0)) {
+		case -1:
+			break;
 		case 0:
 			if (s->cx < screen_size_x(s))
 				bit_clear(s->tabs, s->cx);
@@ -1391,25 +1516,30 @@ input_csi_dispatch(struct input_ctx *ictx)
 		break;
 	case INPUT_CSI_VPA:
 		n = input_get(ictx, 0, 1, 1);
-		screen_write_cursormove(sctx, s->cx, n - 1);
+		if (n != -1)
+			screen_write_cursormove(sctx, s->cx, n - 1);
 		break;
 	case INPUT_CSI_DECSCUSR:
 		n = input_get(ictx, 0, 0, 0);
-		screen_set_cursor_style(s, n);
+		if (n != -1)
+			screen_set_cursor_style(s, n);
 		break;
 	}
 
+	ictx->last = -1;
 	return (0);
 }
 
 /* Handle CSI RM. */
-void
+static void
 input_csi_dispatch_rm(struct input_ctx *ictx)
 {
 	u_int	i;
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		switch (input_get(ictx, i, 0, -1)) {
+		case -1:
+			break;
 		case 4:		/* IRM */
 			screen_write_mode_clear(&ictx->ctx, MODE_INSERT);
 			break;
@@ -1424,7 +1554,7 @@ input_csi_dispatch_rm(struct input_ctx *ictx)
 }
 
 /* Handle CSI private RM. */
-void
+static void
 input_csi_dispatch_rm_private(struct input_ctx *ictx)
 {
 	struct window_pane	*wp = ictx->wp;
@@ -1432,12 +1562,15 @@ input_csi_dispatch_rm_private(struct input_ctx *ictx)
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		switch (input_get(ictx, i, 0, -1)) {
+		case -1:
+			break;
 		case 1:		/* DECCKM */
 			screen_write_mode_clear(&ictx->ctx, MODE_KCURSOR);
 			break;
 		case 3:		/* DECCOLM */
 			screen_write_cursormove(&ictx->ctx, 0, 0);
-			screen_write_clearscreen(&ictx->ctx);
+			screen_write_clearscreen(&ictx->ctx,
+			    ictx->cell.cell.bg);
 			break;
 		case 7:		/* DECAWM */
 			screen_write_mode_clear(&ictx->ctx, MODE_WRAP);
@@ -1451,6 +1584,7 @@ input_csi_dispatch_rm_private(struct input_ctx *ictx)
 		case 1000:
 		case 1001:
 		case 1002:
+		case 1003:
 			screen_write_mode_clear(&ictx->ctx, ALL_MOUSE_MODES);
 			break;
 		case 1004:
@@ -1480,13 +1614,15 @@ input_csi_dispatch_rm_private(struct input_ctx *ictx)
 }
 
 /* Handle CSI SM. */
-void
+static void
 input_csi_dispatch_sm(struct input_ctx *ictx)
 {
 	u_int	i;
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		switch (input_get(ictx, i, 0, -1)) {
+		case -1:
+			break;
 		case 4:		/* IRM */
 			screen_write_mode_set(&ictx->ctx, MODE_INSERT);
 			break;
@@ -1501,7 +1637,7 @@ input_csi_dispatch_sm(struct input_ctx *ictx)
 }
 
 /* Handle CSI private SM. */
-void
+static void
 input_csi_dispatch_sm_private(struct input_ctx *ictx)
 {
 	struct window_pane	*wp = ictx->wp;
@@ -1509,12 +1645,15 @@ input_csi_dispatch_sm_private(struct input_ctx *ictx)
 
 	for (i = 0; i < ictx->param_list_len; i++) {
 		switch (input_get(ictx, i, 0, -1)) {
+		case -1:
+			break;
 		case 1:		/* DECCKM */
 			screen_write_mode_set(&ictx->ctx, MODE_KCURSOR);
 			break;
 		case 3:		/* DECCOLM */
 			screen_write_cursormove(&ictx->ctx, 0, 0);
-			screen_write_clearscreen(&ictx->ctx);
+			screen_write_clearscreen(&ictx->ctx,
+			    ictx->cell.cell.bg);
 			break;
 		case 7:		/* DECAWM */
 			screen_write_mode_set(&ictx->ctx, MODE_WRAP);
@@ -1532,6 +1671,10 @@ input_csi_dispatch_sm_private(struct input_ctx *ictx)
 		case 1002:
 			screen_write_mode_clear(&ictx->ctx, ALL_MOUSE_MODES);
 			screen_write_mode_set(&ictx->ctx, MODE_MOUSE_BUTTON);
+			break;
+		case 1003:
+			screen_write_mode_clear(&ictx->ctx, ALL_MOUSE_MODES);
+			screen_write_mode_set(&ictx->ctx, MODE_MOUSE_ALL);
 			break;
 		case 1004:
 			if (ictx->ctx.s->mode & MODE_FOCUSON)
@@ -1563,7 +1706,7 @@ input_csi_dispatch_sm_private(struct input_ctx *ictx)
 }
 
 /* Handle CSI window operations. */
-void
+static void
 input_csi_dispatch_winops(struct input_ctx *ictx)
 {
 	struct window_pane	*wp = ictx->wp;
@@ -1594,11 +1737,32 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 			/* FALLTHROUGH */
 		case 9:
 		case 10:
-		case 22:
-		case 23:
 			m++;
 			if (input_get(ictx, m, 0, -1) == -1)
 				return;
+			break;
+		case 22:
+			m++;
+			switch (input_get(ictx, m, 0, -1)) {
+			case -1:
+				return;
+			case 0:
+			case 2:
+				screen_push_title(ictx->ctx.s);
+				break;
+			}
+			break;
+		case 23:
+			m++;
+			switch (input_get(ictx, m, 0, -1)) {
+			case -1:
+				return;
+			case 0:
+			case 2:
+				screen_pop_title(ictx->ctx.s);
+				server_status_window(ictx->wp->window);
+				break;
+			}
 			break;
 		case 18:
 			input_reply(ictx, "\033[8;%u;%ut", wp->sy, wp->sx);
@@ -1611,66 +1775,154 @@ input_csi_dispatch_winops(struct input_ctx *ictx)
 	}
 }
 
-/* Handle CSI SGR for 256 colours. */
-void
-input_csi_dispatch_sgr_256(struct input_ctx *ictx, int fgbg, u_int *i)
+/* Helper for 256 colour SGR. */
+static int
+input_csi_dispatch_sgr_256_do(struct input_ctx *ictx, int fgbg, int c)
 {
 	struct grid_cell	*gc = &ictx->cell.cell;
-	int			 c;
 
-	(*i)++;
-	c = input_get(ictx, *i, 0, -1);
-	if (c == -1) {
-		if (fgbg == 38) {
-			gc->flags &= ~GRID_FLAG_FG256;
+	if (c == -1 || c > 255) {
+		if (fgbg == 38)
 			gc->fg = 8;
-		} else if (fgbg == 48) {
-			gc->flags &= ~GRID_FLAG_BG256;
+		else if (fgbg == 48)
 			gc->bg = 8;
-		}
 	} else {
-		if (fgbg == 38) {
-			gc->flags |= GRID_FLAG_FG256;
-			gc->fg = c;
-		} else if (fgbg == 48) {
-			gc->flags |= GRID_FLAG_BG256;
-			gc->bg = c;
-		}
+		if (fgbg == 38)
+			gc->fg = c | COLOUR_FLAG_256;
+		else if (fgbg == 48)
+			gc->bg = c | COLOUR_FLAG_256;
 	}
+	return (1);
+}
+
+/* Handle CSI SGR for 256 colours. */
+static void
+input_csi_dispatch_sgr_256(struct input_ctx *ictx, int fgbg, u_int *i)
+{
+	int	c;
+
+	c = input_get(ictx, (*i) + 1, 0, -1);
+	if (input_csi_dispatch_sgr_256_do(ictx, fgbg, c))
+		(*i)++;
+}
+
+/* Helper for RGB colour SGR. */
+static int
+input_csi_dispatch_sgr_rgb_do(struct input_ctx *ictx, int fgbg, int r, int g,
+    int b)
+{
+	struct grid_cell	*gc = &ictx->cell.cell;
+
+	if (r == -1 || r > 255)
+		return (0);
+	if (g == -1 || g > 255)
+		return (0);
+	if (b == -1 || b > 255)
+		return (0);
+
+	if (fgbg == 38)
+		gc->fg = colour_join_rgb(r, g, b);
+	else if (fgbg == 48)
+		gc->bg = colour_join_rgb(r, g, b);
+	return (1);
 }
 
 /* Handle CSI SGR for RGB colours. */
-void
+static void
 input_csi_dispatch_sgr_rgb(struct input_ctx *ictx, int fgbg, u_int *i)
 {
+	int	r, g, b;
+
+	r = input_get(ictx, (*i) + 1, 0, -1);
+	g = input_get(ictx, (*i) + 2, 0, -1);
+	b = input_get(ictx, (*i) + 3, 0, -1);
+	if (input_csi_dispatch_sgr_rgb_do(ictx, fgbg, r, g, b))
+		(*i) += 3;
+}
+
+/* Handle CSI SGR with a ISO parameter. */
+static void
+input_csi_dispatch_sgr_colon(struct input_ctx *ictx, u_int i)
+{
 	struct grid_cell	*gc = &ictx->cell.cell;
-	int			 c, r, g, b;
+	char			*s = ictx->param_list[i].str, *copy, *ptr, *out;
+	int			 p[8];
+	u_int			 n;
+	const char		*errstr;
 
-	(*i)++;
-	r = input_get(ictx, *i, 0, -1);
-	if (r == -1 || r > 255)
-		return;
-	(*i)++;
-	g = input_get(ictx, *i, 0, -1);
-	if (g == -1 || g > 255)
-		return;
-	(*i)++;
-	b = input_get(ictx, *i, 0, -1);
-	if (b == -1 || b > 255)
-		return;
+	for (n = 0; n < nitems(p); n++)
+		p[n] = -1;
+	n = 0;
 
-	c = colour_find_rgb(r, g, b);
-	if (fgbg == 38) {
-		gc->flags |= GRID_FLAG_FG256;
-		gc->fg = c;
-	} else if (fgbg == 48) {
-		gc->flags |= GRID_FLAG_BG256;
-		gc->bg = c;
+	ptr = copy = xstrdup(s);
+	while ((out = strsep(&ptr, ":")) != NULL) {
+		if (*out != '\0') {
+			p[n++] = strtonum(out, 0, INT_MAX, &errstr);
+			if (errstr != NULL || n == nitems(p)) {
+				free(copy);
+				return;
+			}
+		} else
+			n++;
+		log_debug("%s: %u = %d", __func__, n - 1, p[n - 1]);
+	}
+	free(copy);
+
+	if (n == 0)
+		return;
+	if (p[0] == 4) {
+		if (n != 2)
+			return;
+		switch (p[1]) {
+		case 0:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			break;
+		case 1:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			gc->attr |= GRID_ATTR_UNDERSCORE;
+			break;
+		case 2:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			gc->attr |= GRID_ATTR_UNDERSCORE_2;
+			break;
+		case 3:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			gc->attr |= GRID_ATTR_UNDERSCORE_3;
+			break;
+		case 4:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			gc->attr |= GRID_ATTR_UNDERSCORE_4;
+			break;
+		case 5:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
+			gc->attr |= GRID_ATTR_UNDERSCORE_5;
+			break;
+		}
+		return;
+	}
+	if (p[0] != 38 && p[0] != 48)
+		return;
+	if (p[1] == -1)
+		i = 2;
+	else
+		i = 1;
+	switch (p[i]) {
+	case 2:
+		if (n < i + 4)
+			break;
+		input_csi_dispatch_sgr_rgb_do(ictx, p[0], p[i + 1], p[i + 2],
+		    p[i + 3]);
+		break;
+	case 5:
+		if (n < i + 2)
+			break;
+		input_csi_dispatch_sgr_256_do(ictx, p[0], p[i + 1]);
+		break;
 	}
 }
 
 /* Handle CSI SGR. */
-void
+static void
 input_csi_dispatch_sgr(struct input_ctx *ictx)
 {
 	struct grid_cell	*gc = &ictx->cell.cell;
@@ -1683,7 +1935,13 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 	}
 
 	for (i = 0; i < ictx->param_list_len; i++) {
+		if (ictx->param_list[i].type == INPUT_STRING) {
+			input_csi_dispatch_sgr_colon(ictx, i);
+			continue;
+		}
 		n = input_get(ictx, i, 0, 0);
+		if (n == -1)
+			continue;
 
 		if (n == 38 || n == 48) {
 			i++;
@@ -1700,7 +1958,6 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 
 		switch (n) {
 		case 0:
-		case 10:
 			memcpy(gc, &grid_default_cell, sizeof *gc);
 			break;
 		case 1:
@@ -1713,6 +1970,7 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 			gc->attr |= GRID_ATTR_ITALICS;
 			break;
 		case 4:
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
 			gc->attr |= GRID_ATTR_UNDERSCORE;
 			break;
 		case 5:
@@ -1724,6 +1982,9 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 		case 8:
 			gc->attr |= GRID_ATTR_HIDDEN;
 			break;
+		case 9:
+			gc->attr |= GRID_ATTR_STRIKETHROUGH;
+			break;
 		case 22:
 			gc->attr &= ~(GRID_ATTR_BRIGHT|GRID_ATTR_DIM);
 			break;
@@ -1731,13 +1992,19 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 			gc->attr &= ~GRID_ATTR_ITALICS;
 			break;
 		case 24:
-			gc->attr &= ~GRID_ATTR_UNDERSCORE;
+			gc->attr &= ~GRID_ATTR_ALL_UNDERSCORE;
 			break;
 		case 25:
 			gc->attr &= ~GRID_ATTR_BLINK;
 			break;
 		case 27:
 			gc->attr &= ~GRID_ATTR_REVERSE;
+			break;
+		case 28:
+			gc->attr &= ~GRID_ATTR_HIDDEN;
+			break;
+		case 29:
+			gc->attr &= ~GRID_ATTR_STRIKETHROUGH;
 			break;
 		case 30:
 		case 31:
@@ -1747,11 +2014,9 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 		case 35:
 		case 36:
 		case 37:
-			gc->flags &= ~GRID_FLAG_FG256;
 			gc->fg = n - 30;
 			break;
 		case 39:
-			gc->flags &= ~GRID_FLAG_FG256;
 			gc->fg = 8;
 			break;
 		case 40:
@@ -1762,11 +2027,9 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 		case 45:
 		case 46:
 		case 47:
-			gc->flags &= ~GRID_FLAG_BG256;
 			gc->bg = n - 40;
 			break;
 		case 49:
-			gc->flags &= ~GRID_FLAG_BG256;
 			gc->bg = 8;
 			break;
 		case 90:
@@ -1777,7 +2040,6 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 		case 95:
 		case 96:
 		case 97:
-			gc->flags &= ~GRID_FLAG_FG256;
 			gc->fg = n;
 			break;
 		case 100:
@@ -1788,15 +2050,36 @@ input_csi_dispatch_sgr(struct input_ctx *ictx)
 		case 105:
 		case 106:
 		case 107:
-			gc->flags &= ~GRID_FLAG_BG256;
 			gc->bg = n - 10;
 			break;
 		}
 	}
 }
 
+/* End of input with BEL. */
+static int
+input_end_bel(struct input_ctx *ictx)
+{
+	log_debug("%s", __func__);
+
+	ictx->input_end = INPUT_END_BEL;
+
+	return (0);
+}
+
+/* DCS string started. */
+static void
+input_enter_dcs(struct input_ctx *ictx)
+{
+	log_debug("%s", __func__);
+
+	input_clear(ictx);
+	input_start_timer(ictx);
+	ictx->last = -1;
+}
+
 /* DCS terminator (ST) received. */
-int
+static int
 input_dcs_dispatch(struct input_ctx *ictx)
 {
 	const char	prefix[] = "tmux;";
@@ -1818,16 +2101,18 @@ input_dcs_dispatch(struct input_ctx *ictx)
 }
 
 /* OSC string started. */
-void
+static void
 input_enter_osc(struct input_ctx *ictx)
 {
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
+	input_start_timer(ictx);
+	ictx->last = -1;
 }
 
 /* OSC terminator (ST) received. */
-void
+static void
 input_exit_osc(struct input_ctx *ictx)
 {
 	u_char	*p = ictx->input_buf;
@@ -1838,7 +2123,8 @@ input_exit_osc(struct input_ctx *ictx)
 	if (ictx->input_len < 1 || *p < '0' || *p > '9')
 		return;
 
-	log_debug("%s: \"%s\"", __func__, p);
+	log_debug("%s: \"%s\" (end %s)", __func__, p,
+	    ictx->input_end == INPUT_END_ST ? "ST" : "BEL");
 
 	option = 0;
 	while (*p >= '0' && *p <= '9')
@@ -1849,12 +2135,29 @@ input_exit_osc(struct input_ctx *ictx)
 	switch (option) {
 	case 0:
 	case 2:
-		screen_set_title(ictx->ctx.s, p);
-		server_status_window(ictx->wp->window);
+		if (utf8_isvalid(p)) {
+			screen_set_title(ictx->ctx.s, p);
+			server_status_window(ictx->wp->window);
+		}
+		break;
+	case 4:
+		input_osc_4(ictx, p);
+		break;
+	case 10:
+		input_osc_10(ictx, p);
+		break;
+	case 11:
+		input_osc_11(ictx, p);
 		break;
 	case 12:
-		if (*p != '?') /* ? is colour request */
+		if (utf8_isvalid(p) && *p != '?') /* ? is colour request */
 			screen_set_cursor_colour(ictx->ctx.s, p);
+		break;
+	case 52:
+		input_osc_52(ictx, p);
+		break;
+	case 104:
+		input_osc_104(ictx, p);
 		break;
 	case 112:
 		if (*p == '\0') /* no arguments allowed */
@@ -1867,86 +2170,262 @@ input_exit_osc(struct input_ctx *ictx)
 }
 
 /* APC string started. */
-void
+static void
 input_enter_apc(struct input_ctx *ictx)
 {
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
+	input_start_timer(ictx);
+	ictx->last = -1;
 }
 
 /* APC terminator (ST) received. */
-void
+static void
 input_exit_apc(struct input_ctx *ictx)
 {
 	if (ictx->flags & INPUT_DISCARD)
 		return;
 	log_debug("%s: \"%s\"", __func__, ictx->input_buf);
 
+	if (!utf8_isvalid(ictx->input_buf))
+		return;
 	screen_set_title(ictx->ctx.s, ictx->input_buf);
 	server_status_window(ictx->wp->window);
 }
 
 /* Rename string started. */
-void
+static void
 input_enter_rename(struct input_ctx *ictx)
 {
 	log_debug("%s", __func__);
 
 	input_clear(ictx);
+	input_start_timer(ictx);
+	ictx->last = -1;
 }
 
 /* Rename terminator (ST) received. */
-void
+static void
 input_exit_rename(struct input_ctx *ictx)
 {
 	if (ictx->flags & INPUT_DISCARD)
 		return;
-	if (!options_get_number(&ictx->wp->window->options, "allow-rename"))
+	if (!options_get_number(ictx->wp->window->options, "allow-rename"))
 		return;
 	log_debug("%s: \"%s\"", __func__, ictx->input_buf);
 
+	if (!utf8_isvalid(ictx->input_buf))
+		return;
 	window_set_name(ictx->wp->window, ictx->input_buf);
-	options_set_number(&ictx->wp->window->options, "automatic-rename", 0);
-
+	options_set_number(ictx->wp->window->options, "automatic-rename", 0);
 	server_status_window(ictx->wp->window);
 }
 
 /* Open UTF-8 character. */
-int
-input_utf8_open(struct input_ctx *ictx)
+static int
+input_top_bit_set(struct input_ctx *ictx)
 {
-	if (!options_get_number(&ictx->wp->window->options, "utf8")) {
-		/* Print, and do not switch state. */
-		input_print(ictx);
-		return (-1);
+	struct utf8_data	*ud = &ictx->utf8data;
+
+	ictx->last = -1;
+
+	if (!ictx->utf8started) {
+		if (utf8_open(ud, ictx->ch) != UTF8_MORE)
+			return (0);
+		ictx->utf8started = 1;
+		return (0);
 	}
-	log_debug("%s", __func__);
 
-	utf8_open(&ictx->utf8data, ictx->ch);
+	switch (utf8_append(ud, ictx->ch)) {
+	case UTF8_MORE:
+		return (0);
+	case UTF8_ERROR:
+		ictx->utf8started = 0;
+		return (0);
+	case UTF8_DONE:
+		break;
+	}
+	ictx->utf8started = 0;
+
+	log_debug("%s %hhu '%*s' (width %hhu)", __func__, ud->size,
+	    (int)ud->size, ud->data, ud->width);
+
+	utf8_copy(&ictx->cell.cell.data, ud);
+	screen_write_collect_add(&ictx->ctx, &ictx->cell.cell);
+
 	return (0);
 }
 
-/* Append to UTF-8 character. */
-int
-input_utf8_add(struct input_ctx *ictx)
+/* Handle the OSC 4 sequence for setting (multiple) palette entries. */
+static void
+input_osc_4(struct input_ctx *ictx, const char *p)
 {
-	log_debug("%s", __func__);
+	struct window_pane	*wp = ictx->wp;
+	char			*copy, *s, *next = NULL;
+	long	 		idx;
+	u_int			 r, g, b;
 
-	utf8_append(&ictx->utf8data, ictx->ch);
-	return (0);
+	copy = s = xstrdup(p);
+	while (s != NULL && *s != '\0') {
+		idx = strtol(s, &next, 10);
+		if (*next++ != ';')
+			goto bad;
+		if (idx < 0 || idx >= 0x100)
+			goto bad;
+
+		s = strsep(&next, ";");
+		if (sscanf(s, "rgb:%2x/%2x/%2x", &r, &g, &b) != 3) {
+			s = next;
+			continue;
+		}
+
+		window_pane_set_palette(wp, idx, colour_join_rgb(r, g, b));
+		s = next;
+	}
+
+	free(copy);
+	return;
+
+bad:
+	log_debug("bad OSC 4: %s", p);
+	free(copy);
 }
 
-/* Close UTF-8 string. */
-int
-input_utf8_close(struct input_ctx *ictx)
+/* Handle the OSC 10 sequence for setting foreground colour. */
+static void
+input_osc_10(struct input_ctx *ictx, const char *p)
 {
-	log_debug("%s", __func__);
+	struct window_pane	*wp = ictx->wp;
+	u_int			 r, g, b;
 
-	utf8_append(&ictx->utf8data, ictx->ch);
+	if (sscanf(p, "rgb:%2x/%2x/%2x", &r, &g, &b) != 3)
+	    goto bad;
 
-	grid_cell_set(&ictx->cell.cell, &ictx->utf8data);
-	screen_write_cell(&ictx->ctx, &ictx->cell.cell);
+	wp->colgc.fg = colour_join_rgb(r, g, b);
+	wp->flags |= PANE_REDRAW;
 
-	return (0);
+	return;
+
+bad:
+	log_debug("bad OSC 10: %s", p);
+}
+
+/* Handle the OSC 11 sequence for setting background colour. */
+static void
+input_osc_11(struct input_ctx *ictx, const char *p)
+{
+	struct window_pane	*wp = ictx->wp;
+	u_int			 r, g, b;
+
+	if (sscanf(p, "rgb:%2x/%2x/%2x", &r, &g, &b) != 3)
+	    goto bad;
+
+	wp->colgc.bg = colour_join_rgb(r, g, b);
+	wp->flags |= PANE_REDRAW;
+
+	return;
+
+bad:
+	log_debug("bad OSC 11: %s", p);
+}
+
+/* Handle the OSC 52 sequence for setting the clipboard. */
+static void
+input_osc_52(struct input_ctx *ictx, const char *p)
+{
+	struct window_pane	*wp = ictx->wp;
+	char			*end;
+	const char		*buf;
+	size_t			 len;
+	u_char			*out;
+	int			 outlen, state;
+	struct screen_write_ctx	 ctx;
+	struct paste_buffer	*pb;
+
+	state = options_get_number(global_options, "set-clipboard");
+	if (state != 2)
+		return;
+
+	if ((end = strchr(p, ';')) == NULL)
+		return;
+	end++;
+	if (*end == '\0')
+		return;
+	log_debug("%s: %s", __func__, end);
+
+	if (strcmp(end, "?") == 0) {
+		if ((pb = paste_get_top(NULL)) != NULL) {
+			buf = paste_buffer_data(pb, &len);
+			outlen = 4 * ((len + 2) / 3) + 1;
+			out = xmalloc(outlen);
+			if ((outlen = b64_ntop(buf, len, out, outlen)) == -1) {
+				abort();
+				free(out);
+				return;
+			}
+		} else {
+			outlen = 0;
+			out = NULL;
+		}
+		bufferevent_write(wp->event, "\033]52;;", 6);
+		if (outlen != 0)
+			bufferevent_write(wp->event, out, outlen);
+		if (ictx->input_end == INPUT_END_BEL)
+			bufferevent_write(wp->event, "\007", 1);
+		else
+			bufferevent_write(wp->event, "\033\\", 2);
+		free(out);
+		return;
+	}
+
+	len = (strlen(end) / 4) * 3;
+	if (len == 0)
+		return;
+
+	out = xmalloc(len);
+	if ((outlen = b64_pton(end, out, len)) == -1) {
+		free(out);
+		return;
+	}
+
+	screen_write_start(&ctx, wp, NULL);
+	screen_write_setselection(&ctx, out, outlen);
+	screen_write_stop(&ctx);
+	notify_pane("pane-set-clipboard", wp);
+
+	paste_add(out, outlen);
+}
+
+/* Handle the OSC 104 sequence for unsetting (multiple) palette entries. */
+static void
+input_osc_104(struct input_ctx *ictx, const char *p)
+{
+	struct window_pane	*wp = ictx->wp;
+	char			*copy, *s;
+	long			idx;
+
+	if (*p == '\0') {
+		window_pane_reset_palette(wp);
+		return;
+	}
+
+	copy = s = xstrdup(p);
+	while (*s != '\0') {
+		idx = strtol(s, &s, 10);
+		if (*s != '\0' && *s != ';')
+			goto bad;
+		if (idx < 0 || idx >= 0x100)
+			goto bad;
+
+		window_pane_unset_palette(wp, idx);
+		if (*s == ';')
+			s++;
+	}
+	free(copy);
+	return;
+
+bad:
+	log_debug("bad OSC 104: %s", p);
+	free(copy);
 }

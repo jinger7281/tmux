@@ -1,7 +1,7 @@
 /* $OpenBSD$ */
 
 /*
- * Copyright (c) 2007 Nicholas Marriott <nicm@users.sourceforge.net>
+ * Copyright (c) 2007 Nicholas Marriott <nicholas.marriott@gmail.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -18,21 +18,32 @@
 
 #include <sys/types.h>
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "tmux.h"
 
-int	screen_redraw_cell_border1(struct window_pane *, u_int, u_int);
-int	screen_redraw_cell_border(struct client *, u_int, u_int);
-int	screen_redraw_check_cell(struct client *, u_int, u_int,
-	    struct window_pane **);
-int	screen_redraw_check_is(u_int, u_int, int, struct window *,
-	    struct window_pane *, struct window_pane *);
+struct screen_redraw_ctx {
+	struct client	*c;
 
-void	screen_redraw_draw_borders(struct client *, int, u_int);
-void	screen_redraw_draw_panes(struct client *, u_int);
-void	screen_redraw_draw_status(struct client *, u_int);
-void	screen_redraw_draw_number(struct client *, struct window_pane *, u_int);
+	u_int		 lines;
+	int		 top;
+
+	int		 pane_status;
+
+	u_int		 sx;
+	u_int		 sy;
+	u_int		 ox;
+	u_int		 oy;
+};
+
+static void	screen_redraw_draw_borders(struct screen_redraw_ctx *);
+static void	screen_redraw_draw_panes(struct screen_redraw_ctx *);
+static void	screen_redraw_draw_status(struct screen_redraw_ctx *);
+static void	screen_redraw_draw_pane(struct screen_redraw_ctx *,
+		    struct window_pane *);
+static void	screen_redraw_draw_number(struct screen_redraw_ctx *,
+		    struct window_pane *);
 
 #define CELL_INSIDE 0
 #define CELL_LEFTRIGHT 1
@@ -50,8 +61,12 @@ void	screen_redraw_draw_number(struct client *, struct window_pane *, u_int);
 
 #define CELL_BORDERS " xqlkmjwvtun~"
 
+#define CELL_STATUS_OFF 0
+#define CELL_STATUS_TOP 1
+#define CELL_STATUS_BOTTOM 2
+
 /* Check if cell is on the border of a particular pane. */
-int
+static int
 screen_redraw_cell_border1(struct window_pane *wp, u_int px, u_int py)
 {
 	/* Inside pane. */
@@ -64,15 +79,15 @@ screen_redraw_cell_border1(struct window_pane *wp, u_int px, u_int py)
 		if (wp->xoff != 0 && px == wp->xoff - 1)
 			return (1);
 		if (px == wp->xoff + wp->sx)
-			return (1);
+			return (2);
 	}
 
 	/* Top/bottom borders. */
 	if ((wp->xoff == 0 || px >= wp->xoff - 1) && px <= wp->xoff + wp->sx) {
 		if (wp->yoff != 0 && py == wp->yoff - 1)
-			return (1);
+			return (3);
 		if (py == wp->yoff + wp->sy)
-			return (1);
+			return (4);
 	}
 
 	/* Outside pane. */
@@ -80,7 +95,7 @@ screen_redraw_cell_border1(struct window_pane *wp, u_int px, u_int py)
 }
 
 /* Check if a cell is on the pane border. */
-int
+static int
 screen_redraw_cell_border(struct client *c, u_int px, u_int py)
 {
 	struct window		*w = c->session->curw->window;
@@ -92,23 +107,42 @@ screen_redraw_cell_border(struct client *c, u_int px, u_int py)
 		if (!window_pane_visible(wp))
 			continue;
 		if ((retval = screen_redraw_cell_border1(wp, px, py)) != -1)
-			return (retval);
+			return (!!retval);
 	}
 
 	return (0);
 }
 
 /* Check if cell inside a pane. */
-int
-screen_redraw_check_cell(struct client *c, u_int px, u_int py,
+static int
+screen_redraw_check_cell(struct client *c, u_int px, u_int py, int pane_status,
     struct window_pane **wpp)
 {
 	struct window		*w = c->session->curw->window;
 	struct window_pane	*wp;
 	int			 borders;
+	u_int			 right, line;
+
+	*wpp = NULL;
 
 	if (px > w->sx || py > w->sy)
 		return (CELL_OUTSIDE);
+
+	if (pane_status != CELL_STATUS_OFF) {
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if (!window_pane_visible(wp))
+				continue;
+
+			if (pane_status == CELL_STATUS_TOP)
+				line = wp->yoff - 1;
+			else
+				line = wp->yoff + wp->sy;
+			right = wp->xoff + 2 + wp->status_size - 1;
+
+			if (py == line && px >= wp->xoff + 2 && px <= right)
+				return (CELL_INSIDE);
+		}
+	}
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
 		if (!window_pane_visible(wp))
@@ -135,8 +169,13 @@ screen_redraw_check_cell(struct client *c, u_int px, u_int py,
 			borders |= 8;
 		if (px <= w->sx && screen_redraw_cell_border(c, px + 1, py))
 			borders |= 4;
-		if (py == 0 || screen_redraw_cell_border(c, px, py - 1))
-			borders |= 2;
+		if (pane_status == CELL_STATUS_TOP) {
+			if (py != 0 && screen_redraw_cell_border(c, px, py - 1))
+				borders |= 2;
+		} else {
+			if (py == 0 || screen_redraw_cell_border(c, px, py - 1))
+				borders |= 2;
+		}
 		if (py <= w->sy && screen_redraw_cell_border(c, px, py + 1))
 			borders |= 1;
 
@@ -171,17 +210,23 @@ screen_redraw_check_cell(struct client *c, u_int px, u_int py,
 		}
 	}
 
-	*wpp = NULL;
 	return (CELL_OUTSIDE);
 }
 
 /* Check if the border of a particular pane. */
-int
-screen_redraw_check_is(u_int px, u_int py, int type, struct window *w,
-    struct window_pane *wantwp, struct window_pane *wp)
+static int
+screen_redraw_check_is(u_int px, u_int py, int type, int pane_status,
+    struct window *w, struct window_pane *wantwp, struct window_pane *wp)
 {
+	int	border;
+
 	/* Is this off the active pane border? */
-	if (screen_redraw_cell_border1(wantwp, px, py) != 1)
+	border = screen_redraw_cell_border1(wantwp, px, py);
+	if (border == 0 || border == -1)
+		return (0);
+	if (pane_status == CELL_STATUS_TOP && border == 4)
+		return (0);
+	if (pane_status == CELL_STATUS_BOTTOM && border == 3)
 		return (0);
 
 	/* If there are more than two panes, that's enough. */
@@ -190,6 +235,10 @@ screen_redraw_check_is(u_int px, u_int py, int type, struct window *w,
 
 	/* Else if the cell is not a border cell, forget it. */
 	if (wp == NULL || (type == CELL_OUTSIDE || type == CELL_INSIDE))
+		return (1);
+
+	/* With status lines mark the entire line. */
+	if (pane_status != CELL_STATUS_OFF)
 		return (1);
 
 	/* Check if the pane covers the whole width. */
@@ -214,103 +263,268 @@ screen_redraw_check_is(u_int px, u_int py, int type, struct window *w,
 		return (0);
 	}
 
-	return (type);
+	return (1);
+}
+
+/* Update pane status. */
+static int
+screen_redraw_make_pane_status(struct client *c, struct window *w,
+    struct window_pane *wp)
+{
+	struct grid_cell	 gc;
+	const char		*fmt;
+	struct format_tree	*ft;
+	char			*out;
+	size_t			 outlen;
+	struct screen_write_ctx	 ctx;
+	struct screen		 old;
+
+	if (wp == w->active)
+		style_apply(&gc, w->options, "pane-active-border-style");
+	else
+		style_apply(&gc, w->options, "pane-border-style");
+
+	fmt = options_get_string(w->options, "pane-border-format");
+
+	ft = format_create(c, NULL, FORMAT_PANE|wp->id, 0);
+	format_defaults(ft, c, NULL, NULL, wp);
+
+	memcpy(&old, &wp->status_screen, sizeof old);
+	screen_init(&wp->status_screen, wp->sx, 1, 0);
+	wp->status_screen.mode = 0;
+
+	out = format_expand(ft, fmt);
+	outlen = screen_write_cstrlen("%s", out);
+	if (outlen > wp->sx - 4)
+		outlen = wp->sx - 4;
+	screen_resize(&wp->status_screen, outlen, 1, 0);
+
+	screen_write_start(&ctx, NULL, &wp->status_screen);
+	screen_write_cursormove(&ctx, 0, 0);
+	screen_write_clearline(&ctx, 8);
+	screen_write_cnputs(&ctx, outlen, &gc, "%s", out);
+	screen_write_stop(&ctx);
+
+	free(out);
+	format_free(ft);
+
+	wp->status_size = outlen;
+
+	if (grid_compare(wp->status_screen.grid, old.grid) == 0) {
+		screen_free(&old);
+		return (0);
+	}
+	screen_free(&old);
+	return (1);
+}
+
+/* Draw pane status. */
+static void
+screen_redraw_draw_pane_status(struct screen_redraw_ctx *ctx)
+{
+	struct client		*c = ctx->c;
+	struct window		*w = c->session->curw->window;
+	struct tty		*tty = &c->tty;
+	struct window_pane	*wp;
+	struct screen		*s;
+	u_int			 i, x, width, xoff, yoff, size;
+
+	log_debug("%s: %s @%u", __func__, c->name, w->id);
+
+	TAILQ_FOREACH(wp, &w->panes, entry) {
+		if (!window_pane_visible(wp))
+			continue;
+		s = &wp->status_screen;
+
+		size = wp->status_size;
+		if (ctx->pane_status == CELL_STATUS_TOP)
+			yoff = wp->yoff - 1;
+		else
+			yoff = wp->yoff + wp->sy;
+		xoff = wp->xoff + 2;
+
+		if (xoff + size <= ctx->ox ||
+		    xoff >= ctx->ox + ctx->sx ||
+		    yoff < ctx->oy ||
+		    yoff >= ctx->oy + ctx->sy)
+			continue;
+
+		if (xoff >= ctx->ox && xoff + size <= ctx->ox + ctx->sx) {
+			/* All visible. */
+			i = 0;
+			x = xoff - ctx->ox;
+			width = size;
+		} else if (xoff < ctx->ox && xoff + size > ctx->ox + ctx->sx) {
+			/* Both left and right not visible. */
+			i = ctx->ox;
+			x = 0;
+			width = ctx->sx;
+		} else if (xoff < ctx->ox) {
+			/* Left not visible. */
+			i = ctx->ox - xoff;
+			x = 0;
+			width = size - i;
+		} else {
+			/* Right not visible. */
+			i = 0;
+			x = xoff - ctx->ox;
+			width = size - x;
+		}
+
+		if (ctx->top)
+			yoff += ctx->lines;
+		tty_draw_line(tty, NULL, s, i, 0, width, x, yoff - ctx->oy);
+	}
+	tty_cursor(tty, 0, 0);
+}
+
+/* Update status line and change flags if unchanged. */
+static int
+screen_redraw_update(struct client *c, int flags)
+{
+	struct window		*w = c->session->curw->window;
+	struct window_pane	*wp;
+	struct options		*wo = w->options;
+	int			 redraw;
+
+	if (c->message_string != NULL)
+		redraw = status_message_redraw(c);
+	else if (c->prompt_string != NULL)
+		redraw = status_prompt_redraw(c);
+	else
+		redraw = status_redraw(c);
+	if (!redraw && (~flags & CLIENT_REDRAWSTATUSALWAYS))
+		flags &= ~CLIENT_REDRAWSTATUS;
+
+	if (options_get_number(wo, "pane-border-status") != CELL_STATUS_OFF) {
+		redraw = 0;
+		TAILQ_FOREACH(wp, &w->panes, entry) {
+			if (screen_redraw_make_pane_status(c, w, wp))
+				redraw = 1;
+		}
+		if (redraw)
+			flags |= CLIENT_REDRAWBORDERS;
+	}
+	return (flags);
+}
+
+/* Set up redraw context. */
+static void
+screen_redraw_set_context(struct client *c, struct screen_redraw_ctx *ctx)
+{
+	struct session	*s = c->session;
+	struct options	*oo = s->options;
+	struct window	*w = s->curw->window;
+	struct options	*wo = w->options;
+
+	memset(ctx, 0, sizeof *ctx);
+	ctx->c = c;
+
+	ctx->lines = status_line_size(c);
+	if (c->message_string != NULL || c->prompt_string != NULL)
+		ctx->lines = (ctx->lines == 0) ? 1 : ctx->lines;
+	if (ctx->lines != 0 && options_get_number(oo, "status-position") == 0)
+		ctx->top = 1;
+	ctx->pane_status = options_get_number(wo, "pane-border-status");
+
+	tty_window_offset(&c->tty, &ctx->ox, &ctx->oy, &ctx->sx, &ctx->sy);
+
+	log_debug("%s: %s @%u ox=%u oy=%u sx=%u sy=%u %u/%d", __func__, c->name,
+	    w->id, ctx->ox, ctx->oy, ctx->sx, ctx->sy, ctx->lines, ctx->top);
 }
 
 /* Redraw entire screen. */
 void
-screen_redraw_screen(struct client *c, int draw_panes, int draw_status,
-    int draw_borders)
+screen_redraw_screen(struct client *c)
 {
-	struct options	*oo = &c->session->options;
-	struct tty	*tty = &c->tty;
-	u_int		 top;
-	int	 	 status, spos;
+	struct screen_redraw_ctx	ctx;
+	int				flags;
 
-	/* Suspended clients should not be updated. */
 	if (c->flags & CLIENT_SUSPENDED)
 		return;
 
-	/* Get status line, er, status. */
-	spos = options_get_number(oo, "status-position");
-	if (c->message_string != NULL || c->prompt_string != NULL)
-		status = 1;
-	else
-		status = options_get_number(oo, "status");
-	top = 0;
-	if (status && spos == 0)
-		top = 1;
-	if (!status)
-		draw_status = 0;
+	flags = screen_redraw_update(c, c->flags);
+	screen_redraw_set_context(c, &ctx);
 
-	if (draw_borders)
-		screen_redraw_draw_borders(c, status, top);
-	if (draw_panes)
-		screen_redraw_draw_panes(c, top);
-	if (draw_status)
-		screen_redraw_draw_status(c, top);
-	tty_reset(tty);
+	if (flags & (CLIENT_REDRAWWINDOW|CLIENT_REDRAWBORDERS)) {
+		if (ctx.pane_status != CELL_STATUS_OFF)
+			screen_redraw_draw_pane_status(&ctx);
+		screen_redraw_draw_borders(&ctx);
+	}
+	if (flags & CLIENT_REDRAWWINDOW)
+		screen_redraw_draw_panes(&ctx);
+	if (ctx.lines != 0 &&
+	    (flags & (CLIENT_REDRAWSTATUS|CLIENT_REDRAWSTATUSALWAYS)))
+		screen_redraw_draw_status(&ctx);
+	tty_reset(&c->tty);
 }
 
-/* Draw a single pane. */
+/* Redraw a single pane. */
 void
 screen_redraw_pane(struct client *c, struct window_pane *wp)
 {
-	u_int	i, yoff;
+	struct screen_redraw_ctx	 ctx;
 
 	if (!window_pane_visible(wp))
 		return;
 
-	yoff = wp->yoff;
-	if (status_at_line(c) == 0)
-		yoff++;
+	screen_redraw_set_context(c, &ctx);
 
-	for (i = 0; i < wp->sy; i++)
-		tty_draw_pane(&c->tty, wp, i, wp->xoff, yoff);
+	screen_redraw_draw_pane(&ctx, wp);
 	tty_reset(&c->tty);
 }
 
-/* Draw the borders. */
-void
-screen_redraw_draw_borders(struct client *c, int status, u_int top)
+/* Draw a border cell. */
+static void
+screen_redraw_draw_borders_cell(struct screen_redraw_ctx *ctx, u_int i, u_int j,
+    struct grid_cell *m_active_gc, struct grid_cell *active_gc,
+    struct grid_cell *m_other_gc, struct grid_cell *other_gc)
 {
+	struct client		*c = ctx->c;
 	struct session		*s = c->session;
 	struct window		*w = s->curw->window;
-	struct options		*oo = &w->options;
 	struct tty		*tty = &c->tty;
 	struct window_pane	*wp;
-	struct grid_cell	 m_active_gc, active_gc, m_other_gc, other_gc;
-	struct grid_cell	 msg_gc;
-	u_int		 	 i, j, type, msgx = 0, msgy = 0;
-	int			 active, small, flags;
-	char			 msg[256];
-	const char		*tmp;
-	size_t			 msglen = 0;
+	struct window_pane	*active = w->active;
+	struct window_pane	*marked = marked_pane.wp;
+	u_int			 type, x = ctx->ox + i, y = ctx->oy + j;
+	int			 flag, pane_status = ctx->pane_status;
 
-	small = (tty->sy - status + top > w->sy) || (tty->sx > w->sx);
-	if (small) {
-		flags = w->flags & (WINDOW_FORCEWIDTH|WINDOW_FORCEHEIGHT);
-		if (flags == (WINDOW_FORCEWIDTH|WINDOW_FORCEHEIGHT))
-			tmp = "force-width, force-height";
-		else if (flags == WINDOW_FORCEWIDTH)
-			tmp = "force-width";
-		else if (flags == WINDOW_FORCEHEIGHT)
-			tmp = "force-height";
+	type = screen_redraw_check_cell(c, x, y, pane_status, &wp);
+	if (type == CELL_INSIDE)
+		return;
+	flag = screen_redraw_check_is(x, y, type, pane_status, w, active, wp);
+
+	if (server_is_marked(s, s->curw, marked_pane.wp) &&
+	    screen_redraw_check_is(x, y, type, pane_status, w, marked, wp)) {
+		if (flag)
+			tty_attributes(tty, m_active_gc, NULL);
 		else
-			tmp = "a smaller client";
-		xsnprintf(msg, sizeof msg, "(size %ux%u from %s)",
-		    w->sx, w->sy, tmp);
-		msglen = strlen(msg);
+			tty_attributes(tty, m_other_gc, NULL);
+	} else if (flag)
+		tty_attributes(tty, active_gc, NULL);
+	else
+		tty_attributes(tty, other_gc, NULL);
+	if (ctx->top)
+		tty_cursor(tty, i, ctx->lines + j);
+	else
+		tty_cursor(tty, i, j);
+	tty_putc(tty, CELL_BORDERS[type]);
+}
 
-		if (tty->sy - 1 - status + top > w->sy && tty->sx >= msglen) {
-			msgx = tty->sx - msglen;
-			msgy = tty->sy - 1 - status + top;
-		} else if (tty->sx - w->sx > msglen) {
-			msgx = tty->sx - msglen;
-			msgy = tty->sy - 1 - status + top;
-		} else
-			small = 0;
-	}
+/* Draw the borders. */
+static void
+screen_redraw_draw_borders(struct screen_redraw_ctx *ctx)
+{
+	struct client		*c = ctx->c;
+	struct session		*s = c->session;
+	struct window		*w = s->curw->window;
+	struct tty		*tty = &c->tty;
+	struct options		*oo = w->options;
+	struct grid_cell	 m_active_gc, active_gc, m_other_gc, other_gc;
+	u_int		 	 i, j;
+
+	log_debug("%s: %s @%u", __func__, c->name, w->id);
 
 	style_apply(&other_gc, oo, "pane-border-style");
 	style_apply(&active_gc, oo, "pane-active-border-style");
@@ -321,101 +535,181 @@ screen_redraw_draw_borders(struct client *c, int status, u_int top)
 	memcpy(&m_active_gc, &active_gc, sizeof m_active_gc);
 	m_active_gc.attr ^= GRID_ATTR_REVERSE;
 
-	for (j = 0; j < tty->sy - status; j++) {
+	for (j = 0; j < tty->sy - ctx->lines; j++) {
 		for (i = 0; i < tty->sx; i++) {
-			type = screen_redraw_check_cell(c, i, j, &wp);
-			if (type == CELL_INSIDE)
-				continue;
-			if (type == CELL_OUTSIDE && small &&
-			    i > msgx && j == msgy)
-				continue;
-			active = screen_redraw_check_is(i, j, type, w,
-			    w->active, wp);
-			if (server_is_marked(s, s->curw, marked_window_pane) &&
-			    screen_redraw_check_is(i, j, type, w,
-			    marked_window_pane, wp)) {
-				if (active)
-					tty_attributes(tty, &m_active_gc, NULL);
-				else
-					tty_attributes(tty, &m_other_gc, NULL);
-			} else if (active)
-				tty_attributes(tty, &active_gc, NULL);
-			else
-				tty_attributes(tty, &other_gc, NULL);
-			tty_cursor(tty, i, top + j);
-			tty_putc(tty, CELL_BORDERS[type]);
+			screen_redraw_draw_borders_cell(ctx, i, j,
+			    &m_active_gc, &active_gc, &m_other_gc, &other_gc);
 		}
-	}
-
-	if (small) {
-		memcpy(&msg_gc, &grid_default_cell, sizeof msg_gc);
-		tty_attributes(tty, &msg_gc, NULL);
-		tty_cursor(tty, msgx, msgy);
-		tty_puts(tty, msg);
 	}
 }
 
 /* Draw the panes. */
-void
-screen_redraw_draw_panes(struct client *c, u_int top)
+static void
+screen_redraw_draw_panes(struct screen_redraw_ctx *ctx)
 {
+	struct client		*c = ctx->c;
 	struct window		*w = c->session->curw->window;
-	struct tty		*tty = &c->tty;
 	struct window_pane	*wp;
-	u_int		 	 i;
+
+	log_debug("%s: %s @%u", __func__, c->name, w->id);
 
 	TAILQ_FOREACH(wp, &w->panes, entry) {
 		if (!window_pane_visible(wp))
 			continue;
-		for (i = 0; i < wp->sy; i++)
-			tty_draw_pane(tty, wp, i, wp->xoff, top + wp->yoff);
+		screen_redraw_draw_pane(ctx, wp);
 		if (c->flags & CLIENT_IDENTIFY)
-			screen_redraw_draw_number(c, wp, top);
+			screen_redraw_draw_number(ctx, wp);
 	}
 }
 
 /* Draw the status line. */
-void
-screen_redraw_draw_status(struct client *c, u_int top)
+static void
+screen_redraw_draw_status(struct screen_redraw_ctx *ctx)
 {
+	struct client	*c = ctx->c;
+	struct window	*w = c->session->curw->window;
 	struct tty	*tty = &c->tty;
+	struct screen	*s = &c->status.status;
+	u_int		 i, y;
 
-	if (top)
-		tty_draw_line(tty, NULL, &c->status, 0, 0, 0);
+	log_debug("%s: %s @%u", __func__, c->name, w->id);
+
+	if (ctx->top)
+		y = 0;
 	else
-		tty_draw_line(tty, NULL, &c->status, 0, 0, tty->sy - 1);
+		y = c->tty.sy - ctx->lines;
+	for (i = 0; i < ctx->lines; i++)
+		tty_draw_line(tty, NULL, s, 0, i, UINT_MAX, 0, y + i);
+}
+
+/* Draw one pane. */
+static void
+screen_redraw_draw_pane(struct screen_redraw_ctx *ctx, struct window_pane *wp)
+{
+	struct client	*c = ctx->c;
+	struct window	*w = c->session->curw->window;
+	struct tty	*tty = &c->tty;
+	struct screen	*s;
+	u_int		 i, j, top, x, y, width;
+
+	log_debug("%s: %s @%u %%%u", __func__, c->name, w->id, wp->id);
+
+	if (wp->xoff + wp->sx <= ctx->ox || wp->xoff >= ctx->ox + ctx->sx)
+		return;
+	if (ctx->top)
+		top = ctx->lines;
+	else
+		top = 0;
+
+	s = wp->screen;
+	for (j = 0; j < wp->sy; j++) {
+		if (wp->yoff + j < ctx->oy || wp->yoff + j >= ctx->oy + ctx->sy)
+			continue;
+		y = top + wp->yoff + j - ctx->oy;
+
+		if (wp->xoff >= ctx->ox &&
+		    wp->xoff + wp->sx <= ctx->ox + ctx->sx) {
+			/* All visible. */
+			i = 0;
+			x = wp->xoff - ctx->ox;
+			width = wp->sx;
+		} else if (wp->xoff < ctx->ox &&
+		    wp->xoff + wp->sx > ctx->ox + ctx->sx) {
+			/* Both left and right not visible. */
+			i = ctx->ox;
+			x = 0;
+			width = ctx->sx;
+		} else if (wp->xoff < ctx->ox) {
+			/* Left not visible. */
+			i = ctx->ox - wp->xoff;
+			x = 0;
+			width = wp->sx - i;
+		} else {
+			/* Right not visible. */
+			i = 0;
+			x = wp->xoff - ctx->ox;
+			width = ctx->sx - x;
+		}
+		log_debug("%s: %s %%%u line %u,%u at %u,%u, width %u",
+		    __func__, c->name, wp->id, i, j, x, y, width);
+
+		tty_draw_line(tty, wp, s, i, j, width, x, y);
+	}
 }
 
 /* Draw number on a pane. */
-void
-screen_redraw_draw_number(struct client *c, struct window_pane *wp, u_int top)
+static void
+screen_redraw_draw_number(struct screen_redraw_ctx *ctx, struct window_pane *wp)
 {
+	struct client		*c = ctx->c;
 	struct tty		*tty = &c->tty;
 	struct session		*s = c->session;
-	struct options		*oo = &s->options;
+	struct options		*oo = s->options;
 	struct window		*w = wp->window;
 	struct grid_cell	 gc;
-	u_int			 idx, px, py, i, j, xoff, yoff;
+	u_int			 idx, px, py, i, j, xoff, yoff, sx, sy;
 	int			 colour, active_colour;
 	char			 buf[16], *ptr;
 	size_t			 len;
+
+	if (wp->xoff + wp->sx <= ctx->ox ||
+	    wp->xoff >= ctx->ox + ctx->sx ||
+	    wp->yoff + wp->sy <= ctx->oy ||
+	    wp->yoff >= ctx->oy + ctx->sy)
+		return;
+
+	if (wp->xoff >= ctx->ox && wp->xoff + wp->sx <= ctx->ox + ctx->sx) {
+		/* All visible. */
+		xoff = wp->xoff - ctx->ox;
+		sx = wp->sx;
+	} else if (wp->xoff < ctx->ox &&
+	    wp->xoff + wp->sx > ctx->ox + ctx->sx) {
+		/* Both left and right not visible. */
+		xoff = 0;
+		sx = ctx->sx;
+	} else if (wp->xoff < ctx->ox) {
+		/* Left not visible. */
+		xoff = 0;
+		sx = wp->sx - (ctx->ox - wp->xoff);
+	} else {
+		/* Right not visible. */
+		xoff = wp->xoff - ctx->ox;
+		sx = wp->sx - xoff;
+	}
+	if (wp->yoff >= ctx->oy && wp->yoff + wp->sy <= ctx->oy + ctx->sy) {
+		/* All visible. */
+		yoff = wp->yoff - ctx->oy;
+		sy = wp->sy;
+	} else if (wp->yoff < ctx->oy &&
+	    wp->yoff + wp->sy > ctx->oy + ctx->sy) {
+		/* Both top and bottom not visible. */
+		yoff = 0;
+		sy = ctx->sy;
+	} else if (wp->yoff < ctx->oy) {
+		/* Top not visible. */
+		yoff = 0;
+		sy = wp->sy - (ctx->oy - wp->yoff);
+	} else {
+		/* Bottom not visible. */
+		yoff = wp->yoff - ctx->oy;
+		sy = wp->sy - yoff;
+	}
+
+	if (ctx->top)
+		yoff += ctx->lines;
+	px = sx / 2;
+	py = sy / 2;
 
 	if (window_pane_index(wp, &idx) != 0)
 		fatalx("index not found");
 	len = xsnprintf(buf, sizeof buf, "%u", idx);
 
-	if (wp->sx < len)
+	if (sx < len)
 		return;
 	colour = options_get_number(oo, "display-panes-colour");
 	active_colour = options_get_number(oo, "display-panes-active-colour");
 
-	px = wp->sx / 2; py = wp->sy / 2;
-	xoff = wp->xoff; yoff = wp->yoff;
-
-	if (top)
-		yoff++;
-
-	if (wp->sx < len * 6 || wp->sy < 5) {
+	if (sx < len * 6 || sy < 5) {
 		tty_cursor(tty, xoff + px - len / 2, yoff + py);
 		goto draw_text;
 	}
@@ -425,9 +719,11 @@ screen_redraw_draw_number(struct client *c, struct window_pane *wp, u_int top)
 
 	memcpy(&gc, &grid_default_cell, sizeof gc);
 	if (w->active == wp)
-		colour_set_bg(&gc, active_colour);
+		gc.bg = active_colour;
 	else
-		colour_set_bg(&gc, colour);
+		gc.bg = colour;
+	gc.flags |= GRID_FLAG_NOPALETTE;
+
 	tty_attributes(tty, &gc, wp);
 	for (ptr = buf; *ptr != '\0'; ptr++) {
 		if (*ptr < '0' || *ptr > '9')
@@ -445,16 +741,18 @@ screen_redraw_draw_number(struct client *c, struct window_pane *wp, u_int top)
 	}
 
 	len = xsnprintf(buf, sizeof buf, "%ux%u", wp->sx, wp->sy);
-	if (wp->sx < len || wp->sy < 6)
+	if (sx < len || sy < 6)
 		return;
-	tty_cursor(tty, xoff + wp->sx - len, yoff);
+	tty_cursor(tty, xoff + sx - len, yoff);
 
 draw_text:
 	memcpy(&gc, &grid_default_cell, sizeof gc);
 	if (w->active == wp)
-		colour_set_fg(&gc, active_colour);
+		gc.fg = active_colour;
 	else
-		colour_set_fg(&gc, colour);
+		gc.fg = colour;
+	gc.flags |= GRID_FLAG_NOPALETTE;
+
 	tty_attributes(tty, &gc, wp);
 	tty_puts(tty, buf);
 
