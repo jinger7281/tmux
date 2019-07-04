@@ -249,12 +249,14 @@ static const struct tty_term_code_entry tty_term_codes[] = {
 	[TTYC_SETAF] = { TTYCODE_STRING, "setaf" },
 	[TTYC_SETRGBB] = { TTYCODE_STRING, "setrgbb" },
 	[TTYC_SETRGBF] = { TTYCODE_STRING, "setrgbf" },
+	[TTYC_SETULC] = { TTYCODE_STRING, "Setulc" },
 	[TTYC_SE] = { TTYCODE_STRING, "Se" },
 	[TTYC_SGR0] = { TTYCODE_STRING, "sgr0" },
 	[TTYC_SITM] = { TTYCODE_STRING, "sitm" },
 	[TTYC_SMACS] = { TTYCODE_STRING, "smacs" },
 	[TTYC_SMCUP] = { TTYCODE_STRING, "smcup" },
 	[TTYC_SMKX] = { TTYCODE_STRING, "smkx" },
+	[TTYC_SMOL] = { TTYCODE_STRING, "Smol" },
 	[TTYC_SMSO] = { TTYCODE_STRING, "smso" },
 	[TTYC_SMULX] = { TTYCODE_STRING, "Smulx" },
 	[TTYC_SMUL] = { TTYCODE_STRING, "smul" },
@@ -419,7 +421,9 @@ tty_term_find(char *name, int fd, char **cause)
 	const struct tty_term_code_entry	*ent;
 	struct tty_code				*code;
 	struct options_entry			*o;
-	u_int					 size, i;
+	struct options_array_item		*a;
+	union options_value			*ov;
+	u_int					 i;
 	int		 			 n, error;
 	const char				*s, *acs;
 
@@ -494,12 +498,11 @@ tty_term_find(char *name, int fd, char **cause)
 
 	/* Apply terminal overrides. */
 	o = options_get_only(global_options, "terminal-overrides");
-	if (options_array_size(o, &size) != -1) {
-		for (i = 0; i < size; i++) {
-			s = options_array_get(o, i);
-			if (s != NULL)
-				tty_term_override(term, s);
-		}
+	a = options_array_first(o);
+	while (a != NULL) {
+		ov = options_array_item_value(a);
+		tty_term_override(term, ov->string);
+		a = options_array_next(a);
 	}
 
 	/* Delete curses data. */
@@ -689,7 +692,7 @@ tty_term_describe(struct tty_term *term, enum tty_code_code code)
 		break;
 	case TTYCODE_STRING:
 		strnvis(out, term->codes[code].value.string, sizeof out,
-		    VIS_OCTAL|VIS_TAB|VIS_NL);
+		    VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
 		xsnprintf(s, sizeof s, "%4u: %s: (string) %s",
 		    code, tty_term_codes[code].name,
 		    out);
