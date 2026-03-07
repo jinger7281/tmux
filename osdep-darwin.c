@@ -16,28 +16,28 @@
  * OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
+#include <sys/cdefs.h>
 #include <sys/types.h>
 #include <sys/sysctl.h>
 
-#include <Availability.h>
-#include <event.h>
+#include <AvailabilityMacros.h>
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1050
 #include <libproc.h>
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include "compat.h"
 
 char			*osdep_get_name(int, char *);
 char			*osdep_get_cwd(int);
 struct event_base	*osdep_event_init(void);
 
-#ifndef __unused
-#define __unused __attribute__ ((__unused__))
-#endif
-
 char *
 osdep_get_name(int fd, __unused char *tty)
 {
-#ifdef __MAC_10_7
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1070
 	struct proc_bsdshortinfo	bsdinfo;
 	pid_t				pgrp;
 	int				ret;
@@ -61,7 +61,7 @@ osdep_get_name(int fd, __unused char *tty)
 	size = sizeof kp;
 	if (sysctl(mib, 4, &kp, &size, NULL, 0) == -1)
 		return (NULL);
-	if (*kp.kp_proc.p_comm == '\0')
+	if (size != (sizeof kp) || *kp.kp_proc.p_comm == '\0')
 		return (NULL);
 
 	return (strdup(kp.kp_proc.p_comm));
@@ -71,6 +71,7 @@ osdep_get_name(int fd, __unused char *tty)
 char *
 osdep_get_cwd(int fd)
 {
+#if MAC_OS_X_VERSION_MIN_REQUIRED >= 1050
 	static char			wd[PATH_MAX];
 	struct proc_vnodepathinfo	pathinfo;
 	pid_t				pgrp;
@@ -85,6 +86,7 @@ osdep_get_cwd(int fd)
 		strlcpy(wd, pathinfo.pvi_cdir.vip_path, sizeof wd);
 		return (wd);
 	}
+#endif
 	return (NULL);
 }
 

@@ -24,8 +24,7 @@
 #include "tmux.h"
 
 static void
-regsub_copy(char **buf, size_t *len, const char *text, size_t start,
-    size_t end)
+regsub_copy(char **buf, ssize_t *len, const char *text, size_t start, size_t end)
 {
 	size_t	add = end - start;
 
@@ -35,7 +34,7 @@ regsub_copy(char **buf, size_t *len, const char *text, size_t start,
 }
 
 static void
-regsub_expand(char **buf, size_t *len, const char *with, const char *text,
+regsub_expand(char **buf, ssize_t *len, const char *with, const char *text,
     regmatch_t *m, u_int n)
 {
 	const char	*cp;
@@ -77,10 +76,7 @@ regsub(const char *pattern, const char *with, const char *text, int flags)
 	end = strlen(text);
 
 	while (start <= end) {
-		m[0].rm_so = start;
-		m[0].rm_eo = end;
-
-		if (regexec(&r, text, nitems(m), m, REG_STARTEND) != 0) {
+		if (regexec(&r, text + start, nitems(m), m, 0) != 0) {
 			regsub_copy(&buf, &len, text, start, end);
 			break;
 		}
@@ -89,23 +85,32 @@ regsub(const char *pattern, const char *with, const char *text, int flags)
 		 * Append any text not part of this match (from the end of the
 		 * last match).
 		 */
-		regsub_copy(&buf, &len, text, last, m[0].rm_so);
+		regsub_copy(&buf, &len, text, last, m[0].rm_so + start);
 
 		/*
 		 * If the last match was empty and this one isn't (it is either
 		 * later or has matched text), expand this match. If it is
 		 * empty, move on one character and try again from there.
 		 */
-		if (empty || m[0].rm_so != last || m[0].rm_so != m[0].rm_eo) {
-			regsub_expand(&buf, &len, with, text, m, nitems(m));
+		if (empty ||
+		    start + m[0].rm_so != last ||
+		    m[0].rm_so != m[0].rm_eo) {
+			regsub_expand(&buf, &len, with, text + start, m,
+			    nitems(m));
 
-			last = m[0].rm_eo;
-			start = m[0].rm_eo;
+			last = start + m[0].rm_eo;
+			start += m[0].rm_eo;
 			empty = 0;
 		} else {
-			last = m[0].rm_eo;
-			start = m[0].rm_eo + 1;
+			last = start + m[0].rm_eo;
+			start += m[0].rm_eo + 1;
 			empty = 1;
+		}
+
+		/* Stop now if anchored to start. */
+		if (*pattern == '^') {
+			regsub_copy(&buf, &len, text, start, end);
+			break;
 		}
 	}
 	buf[len] = '\0';

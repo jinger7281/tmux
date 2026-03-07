@@ -1,31 +1,43 @@
-# Makefile.am
-
 # Obvious program stuff.
 bin_PROGRAMS = tmux
 CLEANFILES = tmux.1.mdoc tmux.1.man cmd-parse.c
 
 # Distribution tarball options.
 EXTRA_DIST = \
-	CHANGES README README.ja COPYING example_tmux.conf compat/*.[ch] \
+	CHANGES README README.ja COPYING example_tmux.conf \
 	osdep-*.c mdoc2man.awk tmux.1
+dist_EXTRA_tmux_SOURCES = compat/*.[ch]
 
 # Preprocessor flags.
-AM_CPPFLAGS += @XOPEN_DEFINES@ -DTMUX_CONF="\"$(sysconfdir)/tmux.conf\""
+AM_CPPFLAGS += @XOPEN_DEFINES@ \
+	-DTMUX_VERSION='"@VERSION@"' \
+	-DTMUX_CONF='"$(sysconfdir)/tmux.conf:~/.tmux.conf:$$XDG_CONFIG_HOME/tmux/tmux.conf:~/.config/tmux/tmux.conf"' \
+	-DTMUX_LOCK_CMD='"@DEFAULT_LOCK_CMD@"' \
+	-DTMUX_TERM='"@DEFAULT_TERM@"'
 
 # Additional object files.
 LDADD = $(LIBOBJS)
 
 # Set flags for gcc.
 if IS_GCC
-AM_CFLAGS += -std=gnu99 -O2
+AM_CFLAGS += -std=gnu99
+if IS_OPTIMIZED
+AM_CFLAGS += -O2
+else
+AM_CFLAGS += -O0
+endif
 if IS_DEBUG
 AM_CFLAGS += -g
-AM_CFLAGS += -Wno-long-long -Wall -W -Wformat=2
+AM_CFLAGS += -Wno-long-long -Wall -W -Wformat=2 -Wno-use-after-free
 AM_CFLAGS += -Wmissing-prototypes -Wstrict-prototypes -Wmissing-declarations
 AM_CFLAGS += -Wwrite-strings -Wshadow -Wpointer-arith -Wsign-compare
-AM_CFLAGS += -Wundef -Wbad-function-cast -Winline -Wcast-align
+AM_CFLAGS += -Wundef -Wbad-function-cast -Winline -Wno-cast-align
 AM_CFLAGS += -Wdeclaration-after-statement -Wno-pointer-sign -Wno-attributes
-AM_CFLAGS += -Wno-unused-result
+AM_CFLAGS += -Wno-unused-result -Wno-format-y2k -Wno-unknown-warning-option
+AM_CFLAGS += -Wno-maybe-uninitialized
+if IS_DARWIN
+AM_CFLAGS += -Wno-deprecated-declarations -Wno-macro-redefined
+endif
 AM_CPPFLAGS += -DDEBUG
 endif
 AM_CPPFLAGS += -iquote.
@@ -53,6 +65,16 @@ endif
 # Set flags for NetBSD.
 if IS_NETBSD
 AM_CPPFLAGS += -D_OPENBSD_SOURCE
+endif
+
+# Set flags for Haiku.
+if IS_HAIKU
+AM_CPPFLAGS += -D_BSD_SOURCE
+endif
+
+# Set flags for Cygwin.
+if IS_CYGWIN
+AM_CPPFLAGS += -DTMUX_SOCK_PERM=0
 endif
 
 # List of sources.
@@ -84,6 +106,7 @@ dist_tmux_SOURCES = \
 	cmd-kill-window.c \
 	cmd-list-buffers.c \
 	cmd-list-clients.c \
+	cmd-list-commands.c \
 	cmd-list-keys.c \
 	cmd-list-panes.c \
 	cmd-list-sessions.c \
@@ -111,12 +134,14 @@ dist_tmux_SOURCES = \
 	cmd-select-pane.c \
 	cmd-select-window.c \
 	cmd-send-keys.c \
+	cmd-server-access.c \
 	cmd-set-buffer.c \
 	cmd-set-environment.c \
 	cmd-set-option.c \
 	cmd-show-environment.c \
 	cmd-show-messages.c \
 	cmd-show-options.c \
+	cmd-show-prompt-history.c \
 	cmd-source-file.c \
 	cmd-split-window.c \
 	cmd-swap-pane.c \
@@ -130,10 +155,13 @@ dist_tmux_SOURCES = \
 	control-notify.c \
 	control.c \
 	environ.c \
+	file.c \
 	format.c \
 	format-draw.c \
+	grid-reader.c \
 	grid-view.c \
 	grid.c \
+	hyperlinks.c \
 	input-keys.c \
 	input.c \
 	job.c \
@@ -150,35 +178,42 @@ dist_tmux_SOURCES = \
 	options-table.c \
 	options.c \
 	paste.c \
+	popup.c \
 	proc.c \
 	regsub.c \
 	resize.c \
 	screen-redraw.c \
 	screen-write.c \
 	screen.c \
+	server-acl.c \
 	server-client.c \
 	server-fn.c \
 	server.c \
 	session.c \
+	sort.c \
 	spawn.c \
 	status.c \
 	style.c \
 	tmux.c \
 	tmux.h \
+	tmux-protocol.h \
 	tty-acs.c \
+	tty-draw.c \
+	tty-features.c \
 	tty-keys.c \
 	tty-term.c \
 	tty.c \
+	utf8-combined.c \
 	utf8.c \
 	window-buffer.c \
 	window-client.c \
 	window-clock.c \
 	window-copy.c \
+	window-customize.c \
 	window-tree.c \
 	window.c \
 	xmalloc.c \
-	xmalloc.h \
-	xterm-keys.c
+	xmalloc.h
 nodist_tmux_SOURCES = osdep-@PLATFORM@.c
 
 # Add compat file for forkpty.
@@ -186,9 +221,25 @@ if NEED_FORKPTY
 nodist_tmux_SOURCES += compat/forkpty-@PLATFORM@.c
 endif
 
+# Add compat file for systemd.
+if HAVE_SYSTEMD
+nodist_tmux_SOURCES += compat/systemd.c
+endif
+
 # Add compat file for utf8proc.
 if HAVE_UTF8PROC
 nodist_tmux_SOURCES += compat/utf8proc.c
+endif
+
+# Enable sixel support.
+if ENABLE_SIXEL
+dist_tmux_SOURCES += image.c image-sixel.c
+endif
+
+if NEED_FUZZING
+check_PROGRAMS = fuzz/input-fuzzer
+fuzz_input_fuzzer_LDFLAGS = $(FUZZING_LIBS)
+fuzz_input_fuzzer_LDADD = $(LDADD) $(tmux_OBJECTS)
 endif
 
 # Install tmux.1 in the right format.

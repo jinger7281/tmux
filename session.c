@@ -27,16 +27,13 @@
 #include "tmux.h"
 
 struct sessions		sessions;
-static u_int		next_session_id;
+u_int			next_session_id;
 struct session_groups	session_groups = RB_INITIALIZER(&session_groups);
 
 static void	session_free(int, short, void *);
-
 static void	session_lock_timer(int, short, void *);
-
 static struct winlink *session_next_alert(struct winlink *);
 static struct winlink *session_previous_alert(struct winlink *);
-
 static void	session_group_remove(struct session *);
 static void	session_group_synchronize1(struct session *, struct session *);
 
@@ -47,12 +44,12 @@ session_cmp(struct session *s1, struct session *s2)
 }
 RB_GENERATE(sessions, session, entry, session_cmp);
 
-static int
+int
 session_group_cmp(struct session_group *s1, struct session_group *s2)
 {
 	return (strcmp(s1->name, s2->name));
 }
-RB_GENERATE_STATIC(session_groups, session_group, entry, session_group_cmp);
+RB_GENERATE(session_groups, session_group, entry, session_group_cmp);
 
 /*
  * Find if session is still alive. This is true if it is still on the global
@@ -122,7 +119,6 @@ session_create(const char *prefix, const char *name, const char *cwd,
 
 	s->cwd = xstrdup(cwd);
 
-	s->curw = NULL;
 	TAILQ_INIT(&s->lastw);
 	RB_INIT(&s->windows);
 
@@ -141,7 +137,6 @@ session_create(const char *prefix, const char *name, const char *cwd,
 		s->name = xstrdup(name);
 		s->id = next_session_id++;
 	} else {
-		s->name = NULL;
 		do {
 			s->id = next_session_id++;
 			free(s->name);
@@ -205,6 +200,9 @@ session_destroy(struct session *s, int notify, const char *from)
 	struct winlink	*wl;
 
 	log_debug("session %s destroyed (%s)", s->name, from);
+
+	if (s->curw == NULL)
+		return;
 	s->curw = NULL;
 
 	RB_REMOVE(sessions, &sessions, s);
@@ -231,11 +229,22 @@ session_destroy(struct session *s, int notify, const char *from)
 	session_remove_ref(s, __func__);
 }
 
-/* Check a session name is valid: not empty and no colons or periods. */
-int
+/* Sanitize session name. */
+char *
 session_check_name(const char *name)
 {
-	return (*name != '\0' && name[strcspn(name, ":.")] == '\0');
+	char	*copy, *cp, *new_name;
+
+	if (*name == '\0')
+		return (NULL);
+	copy = xstrdup(name);
+	for (cp = copy; *cp != '\0'; cp++) {
+		if (*cp == ':' || *cp == '.')
+			*cp = '_';
+	}
+	utf8_stravis(&new_name, copy, VIS_OCTAL|VIS_CSTYLE|VIS_TAB|VIS_NL);
+	free(copy);
+	return (new_name);
 }
 
 /* Lock session if it has timed out. */
@@ -258,19 +267,16 @@ session_lock_timer(__unused int fd, __unused short events, void *arg)
 void
 session_update_activity(struct session *s, struct timeval *from)
 {
-	struct timeval	*last = &s->last_activity_time;
 	struct timeval	 tv;
 
-	memcpy(last, &s->activity_time, sizeof *last);
 	if (from == NULL)
 		gettimeofday(&s->activity_time, NULL);
 	else
 		memcpy(&s->activity_time, from, sizeof s->activity_time);
 
-	log_debug("session $%u %s activity %lld.%06d (last %lld.%06d)", s->id,
+	log_debug("session $%u %s activity %lld.%06d", s->id,
 	    s->name, (long long)s->activity_time.tv_sec,
-	    (int)s->activity_time.tv_usec, (long long)last->tv_sec,
-	    (int)last->tv_usec);
+	    (int)s->activity_time.tv_usec);
 
 	if (evtimer_initialized(&s->lock_timer))
 		evtimer_del(&s->lock_timer);
@@ -287,36 +293,48 @@ session_update_activity(struct session *s, struct timeval *from)
 
 /* Find the next usable session. */
 struct session *
-session_next_session(struct session *s)
+session_next_session(struct session *s, struct sort_criteria *sort_crit)
 {
-	struct session *s2;
+	struct session	**l;
+	u_int		  n, i;
 
 	if (RB_EMPTY(&sessions) || !session_alive(s))
 		return (NULL);
 
-	s2 = RB_NEXT(sessions, &sessions, s);
-	if (s2 == NULL)
-		s2 = RB_MIN(sessions, &sessions);
-	if (s2 == s)
-		return (NULL);
-	return (s2);
+	l = sort_get_sessions(&n, sort_crit);
+	for (i = 0; i < n; i++) {
+		if (l[i] == s)
+			break;
+	}
+	if (i == n)
+		fatalx("session %s not found in sorted list", s->name);
+	i++;
+	if (i == n)
+		i = 0;
+	return (l[i]);
 }
 
 /* Find the previous usable session. */
 struct session *
-session_previous_session(struct session *s)
+session_previous_session(struct session *s, struct sort_criteria *sort_crit)
 {
-	struct session *s2;
+	struct session	**l;
+	u_int		  n, i;
 
 	if (RB_EMPTY(&sessions) || !session_alive(s))
 		return (NULL);
 
-	s2 = RB_PREV(sessions, &sessions, s);
-	if (s2 == NULL)
-		s2 = RB_MAX(sessions, &sessions);
-	if (s2 == s)
-		return (NULL);
-	return (s2);
+	l = sort_get_sessions(&n, sort_crit);
+	for (i = 0; i < n; i++) {
+		if (l[i] == s)
+			break;
+	}
+	if (i == n)
+		fatalx("session %s not found in sorted list", s->name);
+	if (i == 0)
+		i = n;
+	i--;
+	return (l[i]);
 }
 
 /* Attach a window to a session. */
@@ -353,10 +371,8 @@ session_detach(struct session *s, struct winlink *wl)
 
 	session_group_synchronize_from(s);
 
-	if (RB_EMPTY(&s->windows)) {
-		session_destroy(s, 1, __func__);
+	if (RB_EMPTY(&s->windows))
 		return (1);
-	}
 	return (0);
 }
 
@@ -478,6 +494,8 @@ session_last(struct session *s)
 int
 session_set_current(struct session *s, struct winlink *wl)
 {
+	struct winlink	*old = s->curw;
+
 	if (wl == NULL)
 		return (-1);
 	if (wl == s->curw)
@@ -486,6 +504,11 @@ session_set_current(struct session *s, struct winlink *wl)
 	winlink_stack_remove(&s->lastw, wl);
 	winlink_stack_push(&s->lastw, s->curw);
 	s->curw = wl;
+	if (options_get_number(global_options, "focus-events")) {
+		if (old != NULL)
+			window_update_focus(old->window);
+		window_update_focus(wl->window);
+	}
 	winlink_clear_flags(wl);
 	window_update_activity(wl->window);
 	tty_update_window_offset(wl->window);
@@ -555,6 +578,7 @@ session_group_remove(struct session *s)
 	TAILQ_REMOVE(&sg->sessions, s, gentry);
 	if (TAILQ_EMPTY(&sg->sessions)) {
 		RB_REMOVE(session_groups, &session_groups, sg);
+		free((void *)sg->name);
 		free(sg);
 	}
 }
@@ -568,7 +592,20 @@ session_group_count(struct session_group *sg)
 
 	n = 0;
 	TAILQ_FOREACH(s, &sg->sessions, gentry)
-	    n++;
+		n++;
+	return (n);
+}
+
+/* Count number of clients attached to sessions in session group. */
+u_int
+session_group_attached_count(struct session_group *sg)
+{
+	struct session	*s;
+	u_int		 n;
+
+	n = 0;
+	TAILQ_FOREACH(s, &sg->sessions, gentry)
+		n += s->attached;
 	return (n);
 }
 
@@ -654,8 +691,10 @@ session_group_synchronize1(struct session *target, struct session *s)
 	TAILQ_INIT(&s->lastw);
 	TAILQ_FOREACH(wl, &old_lastw, sentry) {
 		wl2 = winlink_find_by_index(&s->windows, wl->idx);
-		if (wl2 != NULL)
+		if (wl2 != NULL) {
 			TAILQ_INSERT_TAIL(&s->lastw, wl2, sentry);
+			wl2->flags |= WINLINK_VISITED;
+		}
 	}
 
 	/* Then free the old winlinks list. */
@@ -675,7 +714,7 @@ session_renumber_windows(struct session *s)
 	struct winlink		*wl, *wl1, *wl_new;
 	struct winlinks		 old_wins;
 	struct winlink_stack	 old_lastw;
-	int			 new_idx, new_curw_idx;
+	int			 new_idx, new_curw_idx, marked_idx = -1;
 
 	/* Save and replace old window list. */
 	memcpy(&old_wins, &s->windows, sizeof old_wins);
@@ -692,6 +731,8 @@ session_renumber_windows(struct session *s)
 		winlink_set_window(wl_new, wl->window);
 		wl_new->flags |= wl->flags & WINLINK_ALERTFLAGS;
 
+		if (wl == marked_pane.wl)
+			marked_idx = wl_new->idx;
 		if (wl == s->curw)
 			new_curw_idx = wl_new->idx;
 
@@ -702,15 +743,64 @@ session_renumber_windows(struct session *s)
 	memcpy(&old_lastw, &s->lastw, sizeof old_lastw);
 	TAILQ_INIT(&s->lastw);
 	TAILQ_FOREACH(wl, &old_lastw, sentry) {
+		wl->flags &= ~WINLINK_VISITED;
 		wl_new = winlink_find_by_window(&s->windows, wl->window);
-		if (wl_new != NULL)
+		if (wl_new != NULL) {
 			TAILQ_INSERT_TAIL(&s->lastw, wl_new, sentry);
+			wl_new->flags |= WINLINK_VISITED;
+		}
 	}
 
 	/* Set the current window. */
+	if (marked_idx != -1) {
+		marked_pane.wl = winlink_find_by_index(&s->windows, marked_idx);
+		if (marked_pane.wl == NULL)
+			server_clear_marked();
+	}
 	s->curw = winlink_find_by_index(&s->windows, new_curw_idx);
 
 	/* Free the old winlinks (reducing window references too). */
 	RB_FOREACH_SAFE(wl, winlinks, &old_wins, wl1)
 		winlink_remove(&old_wins, wl);
+}
+
+/* Set the PANE_THEMECHANGED flag for every pane in this session. */
+void
+session_theme_changed(struct session *s)
+{
+	struct window_pane	*wp;
+	struct winlink		*wl;
+
+	if (s != NULL) {
+		RB_FOREACH(wl, winlinks, &s->windows) {
+			TAILQ_FOREACH(wp, &wl->window->panes, entry)
+			    wp->flags |= PANE_THEMECHANGED;
+		}
+	}
+}
+
+/* Update history for all panes. */
+void
+session_update_history(struct session *s)
+{
+	struct winlink		*wl;
+	struct window_pane	*wp;
+	struct grid		*gd;
+	u_int			 limit, osize;
+
+	limit = options_get_number(s->options, "history-limit");
+	RB_FOREACH(wl, winlinks, &s->windows) {
+		TAILQ_FOREACH(wp, &wl->window->panes, entry) {
+			gd = wp->base.grid;
+
+			osize = gd->hsize;
+			gd->hlimit = limit;
+			grid_collect_history(gd, 1);
+
+			if (gd->hsize != osize) {
+				log_debug("%s: %%%u %u -> %u", __func__, wp->id,
+				    osize, gd->hsize);
+			}
+		}
+	}
 }

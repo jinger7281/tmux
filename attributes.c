@@ -31,7 +31,8 @@ attributes_tostring(int attr)
 	if (attr == 0)
 		return ("none");
 
-	len = xsnprintf(buf, sizeof buf, "%s%s%s%s%s%s%s%s%s%s%s%s%s",
+	len = xsnprintf(buf, sizeof buf, "%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+	    (attr & GRID_ATTR_CHARSET) ? "acs," : "",
 	    (attr & GRID_ATTR_BRIGHT) ? "bright," : "",
 	    (attr & GRID_ATTR_DIM) ? "dim," : "",
 	    (attr & GRID_ATTR_UNDERSCORE) ? "underscore," : "",
@@ -44,7 +45,8 @@ attributes_tostring(int attr)
 	    (attr & GRID_ATTR_UNDERSCORE_3) ? "curly-underscore," : "",
 	    (attr & GRID_ATTR_UNDERSCORE_4) ? "dotted-underscore," : "",
 	    (attr & GRID_ATTR_UNDERSCORE_5) ? "dashed-underscore," : "",
-	    (attr & GRID_ATTR_OVERLINE) ? "overline," : "");
+        (attr & GRID_ATTR_OVERLINE) ? "overline," : "",
+	    (attr & GRID_ATTR_NOATTR) ? "noattr," : "");
 	if (len > 0)
 		buf[len - 1] = '\0';
 
@@ -59,9 +61,10 @@ attributes_fromstring(const char *str)
 	size_t		end;
 	u_int		i;
 	struct {
-		const char*	name;
-		int		attr;
+		const char	*name;
+		int		 attr;
 	} table[] = {
+		{ "acs", GRID_ATTR_CHARSET },
 		{ "bright", GRID_ATTR_BRIGHT },
 		{ "bold", GRID_ATTR_BRIGHT },
 		{ "dim", GRID_ATTR_DIM },

@@ -32,8 +32,8 @@ const struct cmd_entry cmd_swap_pane_entry = {
 	.name = "swap-pane",
 	.alias = "swapp",
 
-	.args = { "dDs:t:U", 0, 0 },
-	.usage = "[-dDU] " CMD_SRCDST_PANE_USAGE,
+	.args = { "dDs:t:UZ", 0, 0, NULL },
+	.usage = "[-dDUZ] " CMD_SRCDST_PANE_USAGE,
 
 	.source = { 's', CMD_FIND_PANE, CMD_FIND_DEFAULT_MARKED },
 	.target = { 't', CMD_FIND_PANE, 0 },
@@ -45,32 +45,42 @@ const struct cmd_entry cmd_swap_pane_entry = {
 static enum cmd_retval
 cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 {
+	struct args		*args = cmd_get_args(self);
+	struct cmd_find_state	*source = cmdq_get_source(item);
+	struct cmd_find_state	*target = cmdq_get_target(item);
 	struct window		*src_w, *dst_w;
 	struct window_pane	*tmp_wp, *src_wp, *dst_wp;
 	struct layout_cell	*src_lc, *dst_lc;
 	u_int			 sx, sy, xoff, yoff;
 
-	dst_w = item->target.wl->window;
-	dst_wp = item->target.wp;
-	src_w = item->source.wl->window;
-	src_wp = item->source.wp;
-	server_unzoom_window(dst_w);
+	dst_w = target->wl->window;
+	dst_wp = target->wp;
+	src_w = source->wl->window;
+	src_wp = source->wp;
 
-	if (args_has(self->args, 'D')) {
+	if (window_push_zoom(dst_w, 0, args_has(args, 'Z')))
+		server_redraw_window(dst_w);
+
+	if (args_has(args, 'D')) {
 		src_w = dst_w;
 		src_wp = TAILQ_NEXT(dst_wp, entry);
 		if (src_wp == NULL)
 			src_wp = TAILQ_FIRST(&dst_w->panes);
-	} else if (args_has(self->args, 'U')) {
+	} else if (args_has(args, 'U')) {
 		src_w = dst_w;
 		src_wp = TAILQ_PREV(dst_wp, window_panes, entry);
 		if (src_wp == NULL)
 			src_wp = TAILQ_LAST(&dst_w->panes, window_panes);
 	}
-	server_unzoom_window(src_w);
+
+	if (src_w != dst_w && window_push_zoom(src_w, 0, args_has(args, 'Z')))
+		server_redraw_window(src_w);
 
 	if (src_wp == dst_wp)
-		return (CMD_RETURN_NORMAL);
+		goto out;
+
+	server_client_remove_pane(src_wp);
+	server_client_remove_pane(dst_wp);
 
 	tmp_wp = TAILQ_PREV(dst_wp, window_panes, entry);
 	TAILQ_REMOVE(&dst_w->panes, dst_wp, entry);
@@ -91,10 +101,10 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 
 	src_wp->window = dst_w;
 	options_set_parent(src_wp->options, dst_w->options);
-	src_wp->flags |= PANE_STYLECHANGED;
+	src_wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
 	dst_wp->window = src_w;
 	options_set_parent(dst_wp->options, src_w->options);
-	dst_wp->flags |= PANE_STYLECHANGED;
+	dst_wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
 
 	sx = src_wp->sx; sy = src_wp->sy;
 	xoff = src_wp->xoff; yoff = src_wp->yoff;
@@ -103,7 +113,7 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 	dst_wp->xoff = xoff; dst_wp->yoff = yoff;
 	window_pane_resize(dst_wp, sx, sy);
 
-	if (!args_has(self->args, 'd')) {
+	if (!args_has(args, 'd')) {
 		if (src_w != dst_w) {
 			window_set_active_pane(src_w, dst_wp, 1);
 			window_set_active_pane(dst_w, src_wp, 1);
@@ -118,13 +128,24 @@ cmd_swap_pane_exec(struct cmd *self, struct cmdq_item *item)
 			window_set_active_pane(dst_w, src_wp, 1);
 	}
 	if (src_w != dst_w) {
-		if (src_w->last == src_wp)
-			src_w->last = NULL;
-		if (dst_w->last == dst_wp)
-			dst_w->last = NULL;
+		window_pane_stack_remove(&src_w->last_panes, src_wp);
+		window_pane_stack_remove(&dst_w->last_panes, dst_wp);
+		colour_palette_from_option(&src_wp->palette, src_wp->options);
+		colour_palette_from_option(&dst_wp->palette, dst_wp->options);
+		layout_fix_panes(src_w, NULL);
+		server_redraw_window(src_w);
 	}
-	server_redraw_window(src_w);
+	layout_fix_panes(dst_w, NULL);
 	server_redraw_window(dst_w);
 
+	notify_window("window-layout-changed", src_w);
+	if (src_w != dst_w)
+		notify_window("window-layout-changed", dst_w);
+
+out:
+	if (window_pop_zoom(src_w))
+		server_redraw_window(src_w);
+	if (src_w != dst_w && window_pop_zoom(dst_w))
+		server_redraw_window(dst_w);
 	return (CMD_RETURN_NORMAL);
 }

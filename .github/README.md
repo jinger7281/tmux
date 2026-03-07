@@ -4,7 +4,7 @@ tmux is a terminal multiplexer: it enables a number of terminals to be created,
 accessed, and controlled from a single screen. tmux may be detached from a
 screen and continue running in the background, then later reattached.
 
-This release runs on OpenBSD, FreeBSD, NetBSD, Linux, OS X and Solaris.
+This release runs on OpenBSD, FreeBSD, NetBSD, Linux, macOS and Solaris.
 
 ## Dependencies
 
@@ -14,7 +14,16 @@ page](https://github.com/libevent/libevent/releases/latest).
 It also depends on [ncurses](https://www.gnu.org/software/ncurses/), available
 from [this page](https://invisible-mirror.net/archives/ncurses/).
 
+To build tmux, a C compiler (for example gcc or clang), make, pkg-config and a
+suitable yacc (yacc or bison) are needed.
+
 ## Installation
+
+### Binary packages
+
+Some platforms provide binary packages for tmux, although these are sometimes
+out of date. Examples are listed on
+[this page](https://github.com/tmux/tmux/wiki/Installing).
 
 ### From release tarball
 
@@ -28,9 +37,13 @@ sudo make install
 tmux can use the utempter library to update utmp(5), if it is installed - run
 configure with `--enable-utempter` to enable this.
 
+For more detailed instructions on building and installing tmux, see
+[this page](https://github.com/tmux/tmux/wiki/Installing).
+
 ### From version control
 
-To get and build the latest from version control:
+To get and build the latest from version control - note that this requires
+`autoconf`, `automake` and `pkg-config`:
 
 ~~~bash
 git clone https://github.com/tmux/tmux.git
@@ -38,10 +51,6 @@ cd tmux
 sh autogen.sh
 ./configure && make
 ~~~
-
-(Note that this requires at least a working C compiler, `make`, `autoconf`,
-`automake`, `pkg-config` as well as `libevent` and `ncurses` libraries and
-headers.)
 
 ## Contributing
 
@@ -70,9 +79,9 @@ A small example configuration is in `example_tmux.conf`.
 
 And a bash(1) completion file at:
 
-https://github.com/imomaliev/tmux-bash-completion
+https://github.com/scop/bash-completion/blob/main/completions-core/tmux.bash
 
-For debugging, run tmux with `-v` or `-vv` to generate server and client log 
+For debugging, run tmux with `-v` or `-vv` to generate server and client log
 files in the current directory.
 
 ## Support

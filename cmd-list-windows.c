@@ -28,29 +28,26 @@
  */
 
 #define LIST_WINDOWS_TEMPLATE					\
-	"#{window_index}: #{window_name}#{window_flags} "	\
+	"#{window_index}: #{window_name}#{window_raw_flags} "	\
 	"(#{window_panes} panes) "				\
 	"[#{window_width}x#{window_height}] "			\
 	"[layout #{window_layout}] #{window_id}"		\
 	"#{?window_active, (active),}";
 #define LIST_WINDOWS_WITH_SESSION_TEMPLATE			\
 	"#{session_name}:"					\
-	"#{window_index}: #{window_name}#{window_flags} "	\
+	"#{window_index}: #{window_name}#{window_raw_flags} "	\
 	"(#{window_panes} panes) "				\
 	"[#{window_width}x#{window_height}] "
 
 static enum cmd_retval	cmd_list_windows_exec(struct cmd *, struct cmdq_item *);
 
-static void	cmd_list_windows_server(struct cmd *, struct cmdq_item *);
-static void	cmd_list_windows_session(struct cmd *, struct session *,
-		    struct cmdq_item *, int);
-
 const struct cmd_entry cmd_list_windows_entry = {
 	.name = "list-windows",
 	.alias = "lsw",
 
-	.args = { "F:at:", 0, 0 },
-	.usage = "[-a] [-F format] " CMD_TARGET_SESSION_USAGE,
+	.args = { "aF:f:O:rt:", 0, 0, NULL },
+	.usage = "[-ar] [-F format] [-f filter] [-O order]"
+		 CMD_TARGET_SESSION_USAGE,
 
 	.target = { 't', CMD_FIND_SESSION, 0 },
 
@@ -61,59 +58,58 @@ const struct cmd_entry cmd_list_windows_entry = {
 static enum cmd_retval
 cmd_list_windows_exec(struct cmd *self, struct cmdq_item *item)
 {
-	struct args	*args = self->args;
-
-	if (args_has(args, 'a'))
-		cmd_list_windows_server(self, item);
-	else
-		cmd_list_windows_session(self, item->target.s, item, 0);
-
-	return (CMD_RETURN_NORMAL);
-}
-
-static void
-cmd_list_windows_server(struct cmd *self, struct cmdq_item *item)
-{
-	struct session	*s;
-
-	RB_FOREACH(s, sessions, &sessions)
-		cmd_list_windows_session(self, s, item, 1);
-}
-
-static void
-cmd_list_windows_session(struct cmd *self, struct session *s,
-    struct cmdq_item *item, int type)
-{
-	struct args		*args = self->args;
-	struct winlink		*wl;
-	u_int			 n;
+	struct args		*args = cmd_get_args(self);
+	struct cmd_find_state	*target = cmdq_get_target(item);
+	struct winlink		*wl, **l;
+	struct session		*s;
+	u_int			 i, n;
 	struct format_tree	*ft;
-	const char		*template;
-	char			*line;
+	const char		*template, *filter;
+	char			*line, *expanded;
+	int			 flag;
+	struct sort_criteria	 sort_crit;
 
 	template = args_get(args, 'F');
-	if (template == NULL) {
-		switch (type) {
-		case 0:
-			template = LIST_WINDOWS_TEMPLATE;
-			break;
-		case 1:
+	filter = args_get(args, 'f');
+
+	sort_crit.order = sort_order_from_string(args_get(args, 'O'));
+	if (sort_crit.order == SORT_END && args_has(args, 'O')) {
+		cmdq_error(item, "invalid sort order");
+		return (CMD_RETURN_ERROR);
+	}
+	sort_crit.reversed = args_has(args, 'r');
+
+	if (args_has(args, 'a')) {
+		l = sort_get_winlinks(&n, &sort_crit);
+		if (template == NULL)
 			template = LIST_WINDOWS_WITH_SESSION_TEMPLATE;
-			break;
-		}
+	} else {
+		l = sort_get_winlinks_session(target->s, &n, &sort_crit);
+		if (template == NULL)
+			template = LIST_WINDOWS_TEMPLATE;
 	}
 
-	n = 0;
-	RB_FOREACH(wl, winlinks, &s->windows) {
-		ft = format_create(item->client, item, FORMAT_NONE, 0);
+	for (i = 0; i < n; i++) {
+		wl = l[i];
+		s = wl->session;
+		ft = format_create(cmdq_get_client(item), item, FORMAT_NONE, 0);
 		format_add(ft, "line", "%u", n);
 		format_defaults(ft, NULL, s, wl, NULL);
 
-		line = format_expand(ft, template);
-		cmdq_print(item, "%s", line);
-		free(line);
+		if (filter != NULL) {
+			expanded = format_expand(ft, filter);
+			flag = format_true(expanded);
+			free(expanded);
+		} else
+			flag = 1;
+		if (flag) {
+			line = format_expand(ft, template);
+			cmdq_print(item, "%s", line);
+			free(line);
+		}
 
 		format_free(ft);
-		n++;
 	}
+
+	return (CMD_RETURN_NORMAL);
 }

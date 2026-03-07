@@ -27,36 +27,6 @@
 	((c) != NULL && ((c)->flags & CLIENT_CONTROL))
 
 void
-control_notify_input(struct client *c, struct window_pane *wp,
-    const u_char *buf, size_t len)
-{
-	struct evbuffer *message;
-	u_int		 i;
-
-	if (c->session == NULL)
-	    return;
-
-	/*
-	 * Only write input if the window pane is linked to a window belonging
-	 * to the client's session.
-	 */
-	if (winlink_find_by_window(&c->session->windows, wp->window) != NULL) {
-		message = evbuffer_new();
-		if (message == NULL)
-			fatalx("out of memory");
-		evbuffer_add_printf(message, "%%output %%%u ", wp->id);
-		for (i = 0; i < len; i++) {
-			if (buf[i] < ' ' || buf[i] == '\\')
-			    evbuffer_add_printf(message, "\\%03o", buf[i]);
-			else
-			    evbuffer_add_printf(message, "%c", buf[i]);
-		}
-		control_write_buffer(c, message);
-		evbuffer_free(message);
-	}
-}
-
-void
 control_notify_pane_mode_changed(int pane)
 {
 	struct client	*c;
@@ -79,31 +49,26 @@ control_notify_window_layout_changed(struct window *w)
 	char		*cp;
 
 	template = "%layout-change #{window_id} #{window_layout} "
-	    "#{window_visible_layout} #{window_flags}";
+	    "#{window_visible_layout} #{window_raw_flags}";
+
+	/*
+	 * When the last pane in a window is closed it won't have a layout root
+	 * and we don't need to inform the client about the layout change
+	 * because the whole window will go away soon.
+	 */
+	wl = TAILQ_FIRST(&w->winlinks);
+	if (wl == NULL || w->layout_root == NULL)
+		return;
+	cp = format_single(NULL, template, NULL, NULL, wl, NULL);
 
 	TAILQ_FOREACH(c, &clients, entry) {
 		if (!CONTROL_SHOULD_NOTIFY_CLIENT(c) || c->session == NULL)
 			continue;
 		s = c->session;
-
-		if (winlink_find_by_window_id(&s->windows, w->id) == NULL)
-			continue;
-
-		/*
-		 * When the last pane in a window is closed it won't have a
-		 * layout root and we don't need to inform the client about the
-		 * layout change because the whole window will go away soon.
-		 */
-		if (w->layout_root == NULL)
-			continue;
-
-		wl = winlink_find_by_window(&s->windows, w);
-		if (wl != NULL) {
-			cp = format_single(NULL, template, c, NULL, wl, NULL);
+		if (winlink_find_by_window_id(&s->windows, w->id) != NULL)
 			control_write(c, "%s", cp);
-			free(cp);
-		}
 	}
+	free(cp);
 }
 
 void
@@ -202,6 +167,17 @@ control_notify_client_session_changed(struct client *cc)
 }
 
 void
+control_notify_client_detached(struct client *cc)
+{
+	struct client	*c;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (CONTROL_SHOULD_NOTIFY_CLIENT(c))
+			control_write(c, "%%client-detached %s", cc->name);
+	}
+}
+
+void
 control_notify_session_renamed(struct session *s)
 {
 	struct client	*c;
@@ -251,5 +227,31 @@ control_notify_session_window_changed(struct session *s)
 
 		control_write(c, "%%session-window-changed $%u @%u", s->id,
 		    s->curw->window->id);
+	}
+}
+
+void
+control_notify_paste_buffer_changed(const char *name)
+{
+	struct client	*c;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (!CONTROL_SHOULD_NOTIFY_CLIENT(c))
+			continue;
+
+		control_write(c, "%%paste-buffer-changed %s", name);
+	}
+}
+
+void
+control_notify_paste_buffer_deleted(const char *name)
+{
+	struct client	*c;
+
+	TAILQ_FOREACH(c, &clients, entry) {
+		if (!CONTROL_SHOULD_NOTIFY_CLIENT(c))
+			continue;
+
+		control_write(c, "%%paste-buffer-deleted %s", name);
 	}
 }

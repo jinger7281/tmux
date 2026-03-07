@@ -45,6 +45,13 @@ grid_view_set_cell(struct grid *gd, u_int px, u_int py,
 	grid_set_cell(gd, grid_view_x(gd, px), grid_view_y(gd, py), gc);
 }
 
+/* Set padding. */
+void
+grid_view_set_padding(struct grid *gd, u_int px, u_int py)
+{
+	grid_set_padding(gd, grid_view_x(gd, px), grid_view_y(gd, py));
+}
+
 /* Set cells. */
 void
 grid_view_set_cells(struct grid *gd, u_int px, u_int py,
@@ -75,7 +82,7 @@ grid_view_clear_history(struct grid *gd, u_int bg)
 
 	/* Scroll the lines into the history. */
 	for (yy = 0; yy < last; yy++) {
-		grid_collect_history(gd);
+		grid_collect_history(gd, 0);
 		grid_scroll_history(gd, bg);
 	}
 	if (last < gd->sy)
@@ -100,7 +107,7 @@ grid_view_scroll_region_up(struct grid *gd, u_int rupper, u_int rlower,
     u_int bg)
 {
 	if (gd->flags & GRID_HISTORY) {
-		grid_collect_history(gd);
+		grid_collect_history(gd, 0);
 		if (rupper == 0 && rlower == gd->sy - 1)
 			grid_scroll_history(gd, bg);
 		else {
@@ -166,7 +173,7 @@ grid_view_delete_lines(struct grid *gd, u_int py, u_int ny, u_int bg)
 	sy = grid_view_y(gd, gd->sy);
 
 	grid_move_lines(gd, py, py + ny, sy - py - ny, bg);
-	grid_clear(gd, 0, sy - ny, gd->sx, py + ny - (sy - ny), bg);
+	grid_clear(gd, 0, sy - ny, gd->sx, ny, bg);
 }
 
 /* Delete lines inside scroll region. */
@@ -214,7 +221,7 @@ grid_view_delete_cells(struct grid *gd, u_int px, u_int py, u_int nx, u_int bg)
 	sx = grid_view_x(gd, gd->sx);
 
 	grid_move_cells(gd, px, px + nx, py, sx - px - nx, bg);
-	grid_clear(gd, sx - nx, py, px + nx - (sx - nx), 1, bg);
+	grid_clear(gd, sx - nx, py, nx, 1, bg);
 }
 
 /* Convert cells into a string. */
@@ -224,5 +231,5 @@ grid_view_string_cells(struct grid *gd, u_int px, u_int py, u_int nx)
 	px = grid_view_x(gd, px);
 	py = grid_view_y(gd, py);
 
-	return (grid_string_cells(gd, px, py, nx, NULL, 0, 0, 0));
+	return (grid_string_cells(gd, px, py, nx, NULL, 0, NULL));
 }
